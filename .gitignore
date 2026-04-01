@@ -1,0 +1,19 @@
+# Logs
+*.log
+log/
+
+# Claude Code session data
+.claude/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+*.swp
+*.swo
+*~
+
+# Perl local deps
+local/

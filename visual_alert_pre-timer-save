@@ -1,0 +1,77 @@
+#!/usr/bin/env perl
+
+use Mojolicious::Lite;
+use Mojo::IOLoop;
+
+app->config(hypnotoad => {listen => ['http://*:3000']});
+
+# Shared state
+my $color = 'green';
+my $clients = {};
+
+# Webhook route
+post '/webhook' => sub {
+    my $c = shift;
+    $color = 'red';
+    notify_clients();
+    $c->render(text => 'Webhook received');
+};
+
+# SSE route
+
+get '/events' => sub {
+    my $c = shift;
+    $c->inactivity_timeout(20);
+
+    # Stream setup
+    my $stream = Mojo::IOLoop->stream($c->tx->connection);
+    my $id = $c->tx->connection;
+    $clients->{$id} = $stream;
+    $stream->on(close => sub {
+        delete $clients->{$id};
+    });
+
+    $c->res->headers->content_type('text/event-stream');
+    $c->write("data: $color\n\n");
+};
+
+# Home route
+get '/' => 'index';
+
+# Notify clients about color change
+sub notify_clients {
+    for my $id (keys %$clients) {
+        $clients->{$id}->write("data: $color\n\n");
+    }
+}
+
+app->start;
+__DATA__
+
+@@ index.html.ep
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Color State</title>
+    <script type="text/javascript">
+      var source = new EventSource('/events');
+
+      // Handling messages from the server
+      source.onmessage = function(e) {
+        document.body.style.backgroundColor = e.data;
+      };
+
+      // Error handling for the EventSource
+      source.onerror = function(error) {
+        console.error("EventSource failed:", error);
+        // Optionally, handle the error in the UI, e.g., show an alert or message
+      };
+
+      // Log to confirm the script is running
+      console.log("EventSource script running");
+    </script>
+  </head>
+  <body>
+  </body>
+</html>
