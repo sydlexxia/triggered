@@ -97,6 +97,40 @@ sub reset_remaining {
     return $rem > 0 ? int($rem) : 0;
 }
 
+# Extract camera name from the request body — tolerates three real-world formats:
+#
+#   1. Valid JSON          (curl / most HTTP clients)
+#        Content-Type: application/json
+#        Body: {"camera":"Front Door"}
+#
+#   2. Plain text key:val  (Blue Iris default)
+#        Content-Type: text/plain
+#        Body: camera:Livingroom motionEye
+#
+#   3. URL query parameter  (any client, GET-style param on POST)
+#        POST /webhook?camera=Front+Door
+#
+sub extract_camera {
+    my $c = shift;
+
+    # 1. JSON body (strict parse)
+    my $json = eval { $c->req->json };
+    if ($json && ref $json eq 'HASH' && length($json->{camera} // '')) {
+        return $json->{camera};
+    }
+
+    # 2. Raw body — covers text/plain and any other non-JSON content type
+    my $raw = $c->req->body // '';
+    $raw =~ s/\A\s+|\s+\z//g;          # trim whitespace
+    $raw =~ s/\A['"](.+)['"]\z/$1/s;   # strip wrapping quotes if present
+
+    # "camera:value" plain-text (Blue Iris)
+    return $1 if $raw =~ /\Acamera\s*:\s*(.+)\z/i;
+
+    # 3. URL query / form parameter
+    return $c->req->param('camera') // '';
+}
+
 sub notify_clients {
     my $payload = encode_json({
         color    => $color,
@@ -139,8 +173,7 @@ post '/webhook' => sub {
     return $c->render(json => { error => 'Unauthorized' }, status => 401)
         unless authorized($c);
 
-    my $body    = eval { $c->req->json } // {};
-    $camera_name = $body->{camera} // $c->req->param('camera') // '';
+    $camera_name = extract_camera($c);
     $color       = 'red';
     $alert_time  = time();
     arm_timer();
