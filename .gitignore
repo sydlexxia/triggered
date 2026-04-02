@@ -1,3 +1,7 @@
+# creds
+.git-credentials
+
+
 # Logs
 *.log
 log/
