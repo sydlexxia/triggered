@@ -316,12 +316,34 @@ __DATA__
     .label-red     { color: var(--red); }
     .label-unknown { color: var(--muted); }
 
+    .status-camera {
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      min-height: 1.4em;
+      transition: color 0.4s ease;
+    }
+    .status-camera.cam-red   { color: #fca5a5; }
+    .status-camera.cam-green { color: var(--muted); }
+
     .status-countdown {
       font-size: 1rem;
       color: var(--muted);
       min-height: 1.4em;
       font-variant-numeric: tabular-nums;
     }
+
+    .sound-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 1rem;
+      padding: 4px 10px;
+      cursor: pointer;
+      line-height: 1;
+    }
+    .sound-btn:hover { border-color: var(--text); color: var(--text); }
 
     /* ── Sidebar ─────────────────────────────────────────── */
     .sidebar { grid-area: sidebar; display: flex; flex-direction: column; gap: 12px; }
@@ -479,7 +501,7 @@ function Clock() {
 
 // ── Status Panel ───────────────────────────────────────────────────────────
 
-function StatusPanel({ color, countdown, connState }) {
+function StatusPanel({ color, camera, countdown, connState, soundAvailable, soundMuted, onSoundToggle }) {
   const orbClass   = color === 'red' ? 'orb-red'   : color === 'green' ? 'orb-green'   : 'orb-unknown';
   const labelClass = color === 'red' ? 'label-red'  : color === 'green' ? 'label-green' : 'label-unknown';
   const labelText  = color === 'red' ? 'ALERT'      : color === 'green' ? 'OK'          : '—';
@@ -488,6 +510,9 @@ function StatusPanel({ color, countdown, connState }) {
     <div className="card status-card">
       <div className={`status-orb ${orbClass}`} />
       <div className={`status-label ${labelClass}`}>{labelText}</div>
+      <div className={`status-camera ${color === 'red' ? 'cam-red' : 'cam-green'}`}>
+        {color === 'red' && camera ? camera : ''}
+      </div>
       <div className="status-countdown">
         {color === 'red' && countdown > 0
           ? `Auto-reset in ${countdown}s`
@@ -495,7 +520,14 @@ function StatusPanel({ color, countdown, connState }) {
           ? 'All clear'
           : 'Connecting to alert server…'}
       </div>
-      <ConnectionBadge state={connState} />
+      <div style={{display:'flex', gap:'8px', alignItems:'center'}}>
+        <ConnectionBadge state={connState} />
+        {soundAvailable && (
+          <button className="sound-btn" onClick={onSoundToggle} title="Toggle alert sound">
+            {soundMuted ? '🔇' : '🔊'}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -597,14 +629,31 @@ function Sidebar({ statusConn, logConn }) {
 // ── App ────────────────────────────────────────────────────────────────────
 
 function App() {
-  const [alertColor,  setAlertColor]  = useState('unknown');
-  const [countdown,   setCountdown]   = useState(0);
-  const [statusConn,  setStatusConn]  = useState('connecting');
-  const [logLines,    setLogLines]    = useState([]);
-  const [logConn,     setLogConn]     = useState('connecting');
-  const [autoScroll,  setAutoScroll]  = useState(true);
+  const [alertColor,     setAlertColor]     = useState('unknown');
+  const [cameraName,     setCameraName]     = useState('');
+  const [countdown,      setCountdown]      = useState(0);
+  const [statusConn,     setStatusConn]     = useState('connecting');
+  const [logLines,       setLogLines]       = useState([]);
+  const [logConn,        setLogConn]        = useState('connecting');
+  const [autoScroll,     setAutoScroll]     = useState(true);
+  const [soundAvailable, setSoundAvailable] = useState(false);
+  const [soundMuted,     setSoundMuted]     = useState(false);
   const countdownRef = useRef(null);
   const lineIdRef    = useRef(0);
+  const audioRef     = useRef(null);
+  const prevColorRef = useRef('unknown');
+
+  // ── Check if alert sound is available on triggered.pl ────────────────────
+  useEffect(() => {
+    fetch(`${CFG.triggeredUrl}/alert-sound`, { method: 'HEAD' })
+      .then(r => {
+        if (r.ok) {
+          audioRef.current = new Audio(`${CFG.triggeredUrl}/alert-sound`);
+          setSoundAvailable(true);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // ── Status SSE (direct to triggered.pl) ──────────────────────────────────
   useEffect(() => {
@@ -614,7 +663,17 @@ function App() {
 
     es.onmessage = (e) => {
       const data = JSON.parse(e.data);
+      setCameraName(data.camera || '');
       setAlertColor(data.color);
+
+      // Play sound on green → red transition
+      if (data.color === 'red' && prevColorRef.current !== 'red') {
+        if (audioRef.current && !soundMuted) {
+          audioRef.current.currentTime = 0;
+          audioRef.current.play().catch(() => {});
+        }
+      }
+      prevColorRef.current = data.color;
 
       if (countdownRef.current) {
         clearInterval(countdownRef.current);
@@ -645,7 +704,7 @@ function App() {
       es.close();
       if (countdownRef.current) clearInterval(countdownRef.current);
     };
-  }, []);
+  }, [soundMuted]);
 
   // ── Log SSE (via dashboard.pl) ────────────────────────────────────────────
   useEffect(() => {
@@ -692,8 +751,12 @@ function App() {
 
       <StatusPanel
         color={alertColor}
+        camera={cameraName}
         countdown={countdown}
         connState={statusConn}
+        soundAvailable={soundAvailable}
+        soundMuted={soundMuted}
+        onSoundToggle={() => setSoundMuted(m => !m)}
       />
 
       <Sidebar statusConn={statusConn} logConn={logConn} />

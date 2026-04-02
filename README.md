@@ -73,6 +73,7 @@ All configuration is done via environment variables — no file editing required
 | `RESET_DELAY` | `60` | Seconds before auto-reset to green |
 | `WEBHOOK_TOKEN` | *(unset)* | Bearer token required on `/webhook` and `/reset`. If unset, endpoints are open — a warning is printed at startup |
 | `LOG_FILE` | `./triggered.log` | Path to write log output |
+| `ALERT_SOUND` | *(unset)* | Path to an audio file (`.mp3`, `.wav`, `.ogg`, `.m4a`) played in the browser when an alert fires. Served to the browser at `/alert-sound`. If unset, the alert is silent |
 
 ### dashboard.pl
 
@@ -90,16 +91,26 @@ All configuration is done via environment variables — no file editing required
 
 ### `POST /webhook`
 Triggers an alert — sets state to **red** and starts the auto-reset countdown.
+Accepts an optional JSON body with a `camera` field; the camera name is broadcast
+to all connected clients and displayed on the alert screen.
 
 ```bash
+# Basic trigger
 curl -X POST \
   -H "Authorization: Bearer secret" \
+  http://127.0.0.1:3000/webhook
+
+# With camera name (JSON body)
+curl -X POST \
+  -H "Authorization: Bearer secret" \
+  -H "Content-Type: application/json" \
+  -d '{"camera":"Front Door"}' \
   http://127.0.0.1:3000/webhook
 ```
 
 **Response:**
 ```json
-{ "status": "ok", "color": "red", "reset_in": 60 }
+{ "status": "ok", "color": "red", "reset_in": 60, "camera": "Front Door" }
 ```
 
 ---
@@ -180,16 +191,18 @@ curl http://127.0.0.1:3001/api/ping
    | **Method** | `POST` |
    | **URL** | `http://192.168.2.11:3000/webhook` |
    | **Header** | `Authorization: Bearer secret` |
-   | **Body** | *(leave empty)* |
+   | **Body** | `{"camera":"&CAM"}` |
 
 3. Open `http://192.168.2.11:3000` (or the dashboard at `:3001`) on any browser, TV, or secondary monitor you want to act as a silent sentry display.
 
 **How it works:**
 
 - Blue Iris detects motion → fires the webhook → all open browser windows flip to **red** instantly
-- No audio, no desktop notifications — purely visual, making it ideal as an unobtrusive background monitor or a dedicated wall-mounted display
+- The triggering camera's name (via `&CAM` substitution in the request body) is displayed prominently on the alert screen and in the dashboard status panel
+- Set `ALERT_SOUND=/path/to/alert.mp3` when starting `triggered.pl` to enable an in-browser audio alert — a 🔊/🔇 toggle button appears on both the alert page and dashboard
+- No desktop notifications — purely visual (and optionally audio), making it ideal as an unobtrusive background monitor or a dedicated wall-mounted display
 - The screen auto-resets to **green** after `RESET_DELAY` seconds (default 60), or immediately when Blue Iris sends a reset via `POST /reset` on the **alert ends** action
-- Multiple cameras can all point to the same webhook endpoint — any one of them triggers the alert
+- Multiple cameras can all point to the same webhook endpoint — any one of them triggers the alert, and the camera name identifies which one fired
 - The dashboard at `:3001` logs each camera-triggered event with a timestamp in the live log viewer
 
 **Optional — auto-reset when motion ends:**
@@ -250,6 +263,25 @@ LISTEN_HOST=0.0.0.0 DASHBOARD_PORT=3001 \
   perl dashboard.pl daemon
 ```
 
+### Enable audio alert sound
+
+```bash
+# Any .mp3 / .wav / .ogg / .m4a file works
+ALERT_SOUND=/path/to/alert.mp3 WEBHOOK_TOKEN=secret \
+  LOG_FILE=./triggered.log perl triggered.pl daemon
+```
+
+The file is served by `triggered.pl` at `/alert-sound` and streamed to the browser.
+A 🔊 toggle button appears on the alert page and dashboard — clicking it mutes/unmutes
+without reloading. The sound only plays on the **green → red transition** (not on
+repeated webhooks while already in alert state).
+
+> **Browser autoplay note:** modern browsers require a user gesture before playing audio.
+> The first click or tap on the alert page unlocks audio for that session.
+> For unattended displays, open the page and tap once to prime it.
+
+---
+
 ### Production mode (hypnotoad)
 
 ```bash
@@ -275,6 +307,21 @@ The React dashboard (served by `dashboard.pl`) gives you:
 - **Command reference** — copy-paste start/trigger/reset commands in the sidebar
 
 The dashboard connects directly to `triggered.pl`'s `/events` endpoint for status updates (CORS is enabled on that route) and to its own `/api/log-stream` for the log tail.
+
+---
+
+## PWA — Install on Mobile / Tablet
+
+The alert page (`triggered.pl /`) is a Progressive Web App. On any modern mobile browser:
+
+- **iOS Safari** — tap the Share icon → **Add to Home Screen**
+- **Android Chrome** — tap the menu → **Add to Home Screen** (or install prompt)
+
+Once installed it launches fullscreen with no browser chrome, behaving like a native app.
+The service worker caches the app shell so the last-known state is visible even offline.
+SSE reconnects automatically when the network returns.
+
+For the best wall-mount or bedside display experience, pair with your device's **Guided Access** (iOS) or **Screen Pinning** (Android) to lock the screen to the alert page.
 
 ---
 
