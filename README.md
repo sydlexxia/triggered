@@ -161,6 +161,51 @@ curl http://127.0.0.1:3001/api/ping
 
 ## Usage Examples
 
+### Blue Iris — Silent Tripwire Motion Alert
+
+[Blue Iris](https://blueirissoftware.com) is a Windows-based video surveillance platform that supports webhook **Alert Actions** on any camera trigger. Pairing it with `triggered.pl` turns any motion event into a silent, instantaneous full-screen visual alert on any connected browser — no sound, no popup, no notification fatigue.
+
+**Setup:**
+
+1. Start `triggered.pl` on a LAN-accessible address so Blue Iris can reach it:
+   ```bash
+   LISTEN_HOST=0.0.0.0 PORT=3000 WEBHOOK_TOKEN=secret \
+     LOG_FILE=./triggered.log perl triggered.pl daemon
+   ```
+
+2. In Blue Iris, open **Camera Properties → Alerts → On alert…** and add a **Web request** action:
+
+   | Field | Value |
+   |---|---|
+   | **Method** | `POST` |
+   | **URL** | `http://192.168.2.11:3000/webhook` |
+   | **Header** | `Authorization: Bearer secret` |
+   | **Body** | *(leave empty)* |
+
+3. Open `http://192.168.2.11:3000` (or the dashboard at `:3001`) on any browser, TV, or secondary monitor you want to act as a silent sentry display.
+
+**How it works:**
+
+- Blue Iris detects motion → fires the webhook → all open browser windows flip to **red** instantly
+- No audio, no desktop notifications — purely visual, making it ideal as an unobtrusive background monitor or a dedicated wall-mounted display
+- The screen auto-resets to **green** after `RESET_DELAY` seconds (default 60), or immediately when Blue Iris sends a reset via `POST /reset` on the **alert ends** action
+- Multiple cameras can all point to the same webhook endpoint — any one of them triggers the alert
+- The dashboard at `:3001` logs each camera-triggered event with a timestamp in the live log viewer
+
+**Optional — auto-reset when motion ends:**
+
+Add a second Web request action under **On alert end…**:
+
+| Field | Value |
+|---|---|
+| **Method** | `POST` |
+| **URL** | `http://192.168.2.11:3000/reset` |
+| **Header** | `Authorization: Bearer secret` |
+
+This clears the screen the moment Blue Iris considers the motion event over, rather than waiting for the countdown.
+
+---
+
 ### Trigger from a CI/CD pipeline
 
 ```bash
