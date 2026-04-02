@@ -50,7 +50,10 @@ unless ($token) {
 }
 
 # hypnotoad listen (production mode)
-app->config(hypnotoad => { listen => ["http://$host:$port"] });
+# workers => 1 is required: triggered.pl uses in-process shared state
+# ($color, $clients, $timer_id) which is not shared across forked workers.
+# A multi-worker deployment would need an external broker (e.g. Redis pub/sub).
+app->config(hypnotoad => { listen => ["http://$host:$port"], workers => 1 });
 
 # daemon listen (development mode) — app->config(hypnotoad) is ignored by
 # the daemon server, so we hook before_server_start to apply the same

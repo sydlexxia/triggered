@@ -189,11 +189,11 @@ curl http://127.0.0.1:3001/api/ping
    | Field | Value |
    |---|---|
    | **Method** | `POST` |
-   | **URL** | `http://192.168.2.11:3000/webhook` |
+   | **URL** | `http://<alert-server-ip>:3000/webhook` |
    | **Header** | `Authorization: Bearer secret` |
    | **Body** | `{"camera":"&CAM"}` |
 
-3. Open `http://192.168.2.11:3000` (or the dashboard at `:3001`) on any browser, TV, or secondary monitor you want to act as a silent sentry display.
+3. Open `http://<alert-server-ip>:3000` (or the dashboard at `:3001`) on any browser, TV, or secondary monitor you want to act as a silent sentry display.
 
 **How it works:**
 
@@ -212,7 +212,7 @@ Add a second Web request action under **On alert end…**:
 | Field | Value |
 |---|---|
 | **Method** | `POST` |
-| **URL** | `http://192.168.2.11:3000/reset` |
+| **URL** | `http://<alert-server-ip>:3000/reset` |
 | **Header** | `Authorization: Bearer secret` |
 
 This clears the screen the moment Blue Iris considers the motion event over, rather than waiting for the countdown.
@@ -258,7 +258,7 @@ LISTEN_HOST=0.0.0.0 PORT=3000 WEBHOOK_TOKEN=secret \
 
 # Dashboard pointing to the network address
 LISTEN_HOST=0.0.0.0 DASHBOARD_PORT=3001 \
-  TRIGGERED_URL=http://192.168.2.11:3000 \
+  TRIGGERED_URL=http://<alert-server-ip>:3000 \
   TRIGGERED_LOG=./triggered.log \
   perl dashboard.pl daemon
 ```
@@ -284,15 +284,30 @@ repeated webhooks while already in alert state).
 
 ### Production mode (hypnotoad)
 
+Both scripts can be run under hypnotoad for production deployments.
+
+> **Important:** `triggered.pl` uses in-process shared state for SSE client tracking
+> and alert colour, so it is pre-configured to run with `workers => 1`. Running
+> multiple workers would cause each worker to maintain its own isolated state,
+> breaking SSE fan-out. `dashboard.pl` is stateless and can use the default worker
+> count without issue.
+
 ```bash
-# Start
-WEBHOOK_TOKEN=secret LOG_FILE=./triggered.log hypnotoad triggered.pl
+# Start alert server (workers => 1 enforced in config)
+WEBHOOK_TOKEN=secret LOG_FILE=./triggered.log \
+  ALERT_SOUND=/path/to/alert.mp3 hypnotoad triggered.pl
+
+# Start dashboard
+WEBHOOK_TOKEN=secret TRIGGERED_LOG=./triggered.log \
+  TRIGGERED_URL=http://<alert-server-ip>:3000 hypnotoad dashboard.pl
 
 # Stop
 hypnotoad triggered.pl --stop
+hypnotoad dashboard.pl --stop
 
-# Hot-reload (zero downtime)
+# Hot-reload / config change (zero downtime)
 hypnotoad triggered.pl
+hypnotoad dashboard.pl
 ```
 
 ---
