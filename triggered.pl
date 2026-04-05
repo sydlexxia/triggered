@@ -193,9 +193,10 @@ post '/reset' => sub {
     $timer_id    = undef;
     $color       = 'green';
     $alert_time  = undef;
-    $camera_name = '';
+    # $camera_name = '';
     notify_clients();
-    app->log->info("Alert manually reset");
+    my $cam_info = $camera_name ? " (camera: $camera_name)" : '';
+    app->log->info("Alert manually reset$cam_info");
     $c->render(json => { status => 'ok', color => $color });
 };
 
