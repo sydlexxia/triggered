@@ -23,8 +23,8 @@ A companion React dashboard provides a live status panel and real-time log viewe
 |---|---|
 | `triggered.pl` | Alert server — webhook receiver, SSE broadcaster, auto-reset timer |
 | `dashboard.pl` | Monitoring dashboard — React UI, live log tail over SSE |
+| `trigctl` | Control script — start, stop, status, logs, and more |
 | `cpanfile` | Perl dependency declaration (`Mojolicious >= 9.0`) |
-| `visual_alert.pl` | Original prototype (kept for reference) |
 
 ---
 
@@ -45,24 +45,117 @@ cpanm Mojolicious
 
 ## Quick Start
 
-**Terminal 1 — start the alert server:**
-```bash
-WEBHOOK_TOKEN=secret LOG_FILE=./triggered.log perl triggered.pl daemon
+### 1. Configure
+
+Copy your settings into `.trigctl.env` in the project directory (it's gitignored):
+
+```
+WEBHOOK_TOKEN=your_secret_here
+LISTEN_HOST=0.0.0.0
+RESET_DELAY=60
 ```
 
-**Terminal 2 — start the dashboard:**
+### 2. (Optional) Add trigctl to PATH
+
 ```bash
-WEBHOOK_TOKEN=secret TRIGGERED_LOG=./triggered.log perl dashboard.pl daemon
+ln -sf /path/to/visual_alert/trigctl ~/bin/trigctl
+```
+
+### 3. Start
+
+```bash
+trigctl start
 ```
 
 - Alert page: **http://127.0.0.1:3000**
 - Dashboard: **http://127.0.0.1:3001**
+
+```bash
+trigctl status    # process state, HTTP health, connected client count
+trigctl stop      # graceful shutdown of both servers
+```
+
+---
+
+## trigctl
+
+`trigctl` manages both servers with a single command. It reads defaults from `.trigctl.env` in the project directory; any `KEY=VALUE` argument on the command line overrides the file.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `trigctl start [--prod\|--dev]` | Start `triggered.pl` and `dashboard.pl` |
+| `trigctl stop` | Stop both servers |
+| `trigctl restart [--prod\|--dev]` | Stop then start |
+| `trigctl status` | Process state, HTTP health, connected client count, alert state |
+| `trigctl logs [triggered\|dashboard]` | Tail log output (default: both) |
+| `trigctl reload` | Zero-downtime hypnotoad reload — prod mode only |
+| `trigctl trigger ["Camera Name"]` | Fire a test webhook using the configured token |
+| `trigctl reset` | Clear the alert via API |
+| `trigctl help` | Full usage reference |
+
+### Modes
+
+| Flag | Server | Use case |
+|---|---|---|
+| `--dev` *(default)* | `perl daemon` | Development — single process, auto-reloads on source changes |
+| `--prod` | `hypnotoad` | Production — prefork, graceful restarts, zero-downtime reload |
+
+### Config file — `.trigctl.env`
+
+Variables in this file are loaded as defaults on every invocation. The file is gitignored to keep secrets out of version control.
+
+```bash
+# .trigctl.env
+WEBHOOK_TOKEN=your_secret_here
+LISTEN_HOST=0.0.0.0
+PORT=3000
+DASHBOARD_PORT=3001
+RESET_DELAY=60
+LOG_FILE=./triggered.log
+TRIGGERED_LOG=./triggered.log
+DASHBOARD_LOG=./dashboard.log
+# ALERT_SOUND=/path/to/alert.mp3
+```
+
+CLI `KEY=VALUE` args always take precedence:
+
+```bash
+trigctl start RESET_DELAY=30 LISTEN_HOST=0.0.0.0
+```
+
+### Examples
+
+```bash
+# Start in dev mode (reads token etc. from .trigctl.env)
+trigctl start
+
+# Start in production mode
+trigctl start --prod
+
+# Check what's running
+trigctl status
+
+# Fire a test alert
+trigctl trigger "Front Door"
+
+# Clear it manually
+trigctl reset
+
+# Watch the alert server log
+trigctl logs triggered
+
+# Zero-downtime reload after editing a Perl script (prod only)
+trigctl reload
+```
 
 ---
 
 ## Configuration
 
 All configuration is done via environment variables — no file editing required.
+The easiest way to manage them is via `.trigctl.env` (see above).
 
 ### triggered.pl
 
@@ -106,6 +199,9 @@ curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"camera":"Front Door"}' \
   http://127.0.0.1:3000/webhook
+
+# Shortcut via trigctl (uses token from .trigctl.env)
+trigctl trigger "Front Door"
 ```
 
 **Response:**
@@ -122,6 +218,9 @@ Manually clears the alert — sets state to **green** immediately, cancels the t
 curl -X POST \
   -H "Authorization: Bearer secret" \
   http://127.0.0.1:3000/reset
+
+# Shortcut
+trigctl reset
 ```
 
 **Response:**
@@ -140,7 +239,7 @@ curl -N http://127.0.0.1:3000/events
 
 **Event format:**
 ```
-data: {"color":"red","reset_in":42}
+data: {"color":"red","reset_in":42,"camera":"Front Door"}
 ```
 
 ---
@@ -178,10 +277,13 @@ curl http://127.0.0.1:3001/api/ping
 
 **Setup:**
 
-1. Start `triggered.pl` on a LAN-accessible address so Blue Iris can reach it:
+1. Configure `.trigctl.env` for LAN access and start:
+   ```
+   LISTEN_HOST=0.0.0.0
+   WEBHOOK_TOKEN=secret
+   ```
    ```bash
-   LISTEN_HOST=0.0.0.0 PORT=3000 WEBHOOK_TOKEN=secret \
-     LOG_FILE=./triggered.log perl triggered.pl daemon
+   trigctl start
    ```
 
 2. In Blue Iris, open **Camera Properties → Alerts → On alert…** and add a **Web request** action:
@@ -199,7 +301,7 @@ curl http://127.0.0.1:3001/api/ping
 
 - Blue Iris detects motion → fires the webhook → all open browser windows flip to **red** instantly
 - The triggering camera's name (via `&CAM` substitution in the request body) is displayed prominently on the alert screen and in the dashboard status panel
-- Set `ALERT_SOUND=/path/to/alert.mp3` when starting `triggered.pl` to enable an in-browser audio alert — a 🔊/🔇 toggle button appears on both the alert page and dashboard
+- Set `ALERT_SOUND=/path/to/alert.mp3` in `.trigctl.env` to enable an in-browser audio alert — a 🔊/🔇 toggle button appears on both the alert page and dashboard
 - No desktop notifications — purely visual (and optionally audio), making it ideal as an unobtrusive background monitor or a dedicated wall-mounted display
 - The screen auto-resets to **green** after `RESET_DELAY` seconds (default 60), or immediately when Blue Iris sends a reset via `POST /reset` on the **alert ends** action
 - Multiple cameras can all point to the same webhook endpoint — any one of them triggers the alert, and the camera name identifies which one fired
@@ -242,33 +344,11 @@ if ! /usr/local/bin/check-service.sh; then
 fi
 ```
 
-### Auto-reset after a custom delay
-
-```bash
-RESET_DELAY=300 WEBHOOK_TOKEN=secret LOG_FILE=./triggered.log \
-  perl triggered.pl daemon
-```
-
-### Run on a LAN-accessible address
-
-```bash
-# Single instance reachable from all machines on the network
-LISTEN_HOST=0.0.0.0 PORT=3000 WEBHOOK_TOKEN=secret \
-  LOG_FILE=./triggered.log perl triggered.pl daemon
-
-# Dashboard pointing to the network address
-LISTEN_HOST=0.0.0.0 DASHBOARD_PORT=3001 \
-  TRIGGERED_URL=http://<alert-server-ip>:3000 \
-  TRIGGERED_LOG=./triggered.log \
-  perl dashboard.pl daemon
-```
-
 ### Enable audio alert sound
 
-```bash
-# Any .mp3 / .wav / .ogg / .m4a file works
-ALERT_SOUND=/path/to/alert.mp3 WEBHOOK_TOKEN=secret \
-  LOG_FILE=./triggered.log perl triggered.pl daemon
+Add to `.trigctl.env`:
+```
+ALERT_SOUND=/path/to/alert.mp3
 ```
 
 The file is served by `triggered.pl` at `/alert-sound` and streamed to the browser.
@@ -282,9 +362,13 @@ repeated webhooks while already in alert state).
 
 ---
 
-### Production mode (hypnotoad)
+### Production mode
 
-Both scripts can be run under hypnotoad for production deployments.
+```bash
+trigctl start --prod    # starts both servers under hypnotoad
+trigctl reload          # zero-downtime rolling restart (no dropped connections)
+trigctl stop            # graceful shutdown
+```
 
 > **Important:** `triggered.pl` uses in-process shared state for SSE client tracking
 > and alert colour, so it is pre-configured to run with `workers => 1`. Running
@@ -292,22 +376,17 @@ Both scripts can be run under hypnotoad for production deployments.
 > breaking SSE fan-out. `dashboard.pl` is stateless and can use the default worker
 > count without issue.
 
+#### Manual hypnotoad commands (without trigctl)
+
 ```bash
-# Start alert server (workers => 1 enforced in config)
 WEBHOOK_TOKEN=secret LOG_FILE=./triggered.log \
   ALERT_SOUND=/path/to/alert.mp3 hypnotoad triggered.pl
 
-# Start dashboard
 WEBHOOK_TOKEN=secret TRIGGERED_LOG=./triggered.log \
   TRIGGERED_URL=http://<alert-server-ip>:3000 hypnotoad dashboard.pl
 
-# Stop
 hypnotoad triggered.pl --stop
 hypnotoad dashboard.pl --stop
-
-# Hot-reload / config change (zero downtime)
-hypnotoad triggered.pl
-hypnotoad dashboard.pl
 ```
 
 ---
@@ -345,6 +424,7 @@ For the best wall-mount or bedside display experience, pair with your device's *
 - `WEBHOOK_TOKEN` uses HTTP Bearer authentication. If unset, `/webhook` and `/reset` are open to anyone who can reach the port — always set a token in any networked environment.
 - Both scripts bind to `127.0.0.1` by default. Set `LISTEN_HOST=0.0.0.0` only if you need LAN/WAN access.
 - For public-facing deployments, place both servers behind a TLS-terminating reverse proxy (nginx, Caddy) and set `LISTEN_HOST=127.0.0.1`.
+- `.trigctl.env` contains your token — it is gitignored by default. Never commit it.
 - For high-security environments, replace the `eq` bearer token comparison in `triggered.pl` with a constant-time comparison to prevent timing-based token enumeration.
 
 ---
@@ -357,3 +437,4 @@ For the best wall-mount or bedside display experience, pair with your device's *
 | `visual_alert.pl` | Added 60-second auto-reset timer |
 | `triggered.pl` | Full rewrite — auth, env config, JSON API, CORS, logging |
 | `dashboard.pl` | React monitoring dashboard with live log tail |
+| `trigctl` | Control script — unified start/stop/status/reload for both servers |
