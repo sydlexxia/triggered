@@ -1,5 +1,11 @@
 # creds
 .git-credentials
+.trigctl.env
+
+# trigctl runtime
+.pids/
+.trigctl-triggered.log
+.trigctl-dashboard.log
 
 
 # Logs

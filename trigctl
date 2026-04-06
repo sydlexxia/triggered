@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# trigctl — manage visual_alert servers
+#
+# Usage: trigctl <command> [--prod|--dev] [KEY=VALUE ...]
+#
+# Commands:
+#   start    [--prod|--dev]  Start triggered.pl and dashboard.pl
+#   stop                     Stop both servers
+#   restart  [--prod|--dev]  Stop then start
+#   status                   Show process state and connected client count
+#   logs     [triggered|dashboard]  Tail log output
+#   reload                   Zero-downtime reload (prod/hypnotoad only)
+#   trigger  [camera name]   Fire a test webhook using configured token
+#   reset                    Manually clear alert via API
+#   help                     Show this help
+#
+# Config file: .trigctl.env in the same directory as this script.
+# Variables set there are loaded as defaults; KEY=VALUE CLI args override them.
+#
+#   echo 'WEBHOOK_TOKEN=mysecret' >> .trigctl.env
+#   echo 'LISTEN_HOST=0.0.0.0'   >> .trigctl.env
+
+# ── ANSI colors (disabled when stdout is not a terminal) ──────────────────────
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'   GREEN='\033[0;32m'  YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'  BOLD='\033[1m'      DIM='\033[2m'
+  RESET='\033[0m'
+else
+  RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
+fi
+
+# ── Paths (resolve symlinks so APP_DIR is always the real script directory) ───
+_src="${BASH_SOURCE[0]}"
+while [[ -L "$_src" ]]; do
+  _dir="$(cd "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
+unset _src _dir
+APP_DIR="$SCRIPT_DIR"
+PID_DIR="$APP_DIR/.pids"
+CONFIG_FILE="$APP_DIR/.trigctl.env"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+LISTEN_HOST="127.0.0.1"
+PORT="3000"
+DASHBOARD_PORT="3001"
+RESET_DELAY="60"
+WEBHOOK_TOKEN=""
+LOG_FILE="$APP_DIR/triggered.log"
+DASHBOARD_LOG="$APP_DIR/dashboard.log"
+ALERT_SOUND=""
+TRIGGERED_LOG="$APP_DIR/triggered.log"
+TRIGGERED_URL=""   # computed after host/port are resolved
+MODE="dev"
+
+# ── Load .trigctl.env (if present) ───────────────────────────────────────────
+# shellcheck disable=SC1090
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# ── Parse command and arguments ───────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --prod) MODE="prod" ;;
+    --dev)  MODE="dev" ;;
+    *=*)
+      key="${arg%%=*}"
+      val="${arg#*=}"
+      case "$key" in
+        LISTEN_HOST|PORT|DASHBOARD_PORT|RESET_DELAY|WEBHOOK_TOKEN|\
+        LOG_FILE|DASHBOARD_LOG|ALERT_SOUND|TRIGGERED_LOG|TRIGGERED_URL|MODE)
+          printf -v "$key" '%s' "$val"
+          ;;
+        *) echo "Warning: unknown variable '$key' ignored" >&2 ;;
+      esac
+      ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+
+# Resolve relative log paths against APP_DIR
+[[ "$LOG_FILE"      != /* ]] && LOG_FILE="$APP_DIR/${LOG_FILE#./}"
+[[ "$TRIGGERED_LOG" != /* ]] && TRIGGERED_LOG="$APP_DIR/${TRIGGERED_LOG#./}"
+[[ "$DASHBOARD_LOG" != /* ]] && DASHBOARD_LOG="$APP_DIR/${DASHBOARD_LOG#./}"
+
+# Compute TRIGGERED_URL from host/port if not explicitly set
+if [[ -z "$TRIGGERED_URL" ]]; then
+  if [[ "$LISTEN_HOST" == "0.0.0.0" ]]; then
+    TRIGGERED_URL="http://127.0.0.1:${PORT}"
+  else
+    TRIGGERED_URL="http://${LISTEN_HOST}:${PORT}"
+  fi
+fi
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+mkdir -p "$PID_DIR"
+
+say()     { printf '%b\n' "${*}${RESET}"; }
+ok()      { say "${GREEN}✓  ${*}"; }
+fail()    { say "${RED}✗  ${*}"; }
+info()    { say "${CYAN}→  ${*}"; }
+warn()    { say "${YELLOW}!  ${*}"; }
+section() { say "\n${BOLD}${*}"; }
+
+# ── Process helpers ───────────────────────────────────────────────────────────
+
+# True if PID is alive
+proc_alive() { [[ -n "$1" ]] && kill -0 "$1" 2>/dev/null; }
+
+# Return running PID for a service: try pid file, then pgrep fallback
+get_pid() {
+  local name="$1"
+  local pid_file="$PID_DIR/${name}.pid"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null)"
+    if proc_alive "$pid"; then
+      echo "$pid"; return 0
+    fi
+    rm -f "$pid_file"   # stale
+  fi
+  # Fallback: search process list
+  pgrep -f "perl.*${name}\.pl" 2>/dev/null | head -1
+}
+
+# Save a PID for a named service; verify it's alive first
+save_pid() {
+  local name="$1" pid="$2"
+  if proc_alive "$pid"; then
+    echo "$pid" > "$PID_DIR/${name}.pid"
+    return 0
+  fi
+  return 1
+}
+
+# Count established TCP connections to a port (proxy for connected SSE clients)
+conn_count() {
+  lsof -iTCP:"$1" -sTCP:ESTABLISHED -nP 2>/dev/null | grep -vc COMMAND || true
+}
+
+# HTTP GET, return status code only
+http_code() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1" 2>/dev/null || echo "000"
+}
+
+# Poll a URL until it returns 2xx/3xx (max ~10 s)
+wait_ready() {
+  local url="$1" i=0
+  while (( i < 20 )); do
+    local code
+    code="$(http_code "$url")"
+    [[ "$code" =~ ^[23] ]] && return 0
+    sleep 0.5
+    (( i++ ))
+  done
+  return 1
+}
+
+# True if a TCP port has a LISTEN socket
+port_in_use() {
+  lsof -iTCP:"$1" -sTCP:LISTEN -nP 2>/dev/null | grep -q LISTEN
+}
+
+# ── build_env: populate global arrays _TENV / _DENV (bash 3.2 compatible) ─────
+build_triggered_env() {
+  _TENV=(
+    "PORT=$PORT"
+    "LISTEN_HOST=$LISTEN_HOST"
+    "RESET_DELAY=$RESET_DELAY"
+    "LOG_FILE=$LOG_FILE"
+  )
+  [[ -n "$WEBHOOK_TOKEN" ]] && _TENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
+  [[ -n "$ALERT_SOUND"   ]] && _TENV+=("ALERT_SOUND=$ALERT_SOUND")
+}
+
+build_dashboard_env() {
+  _DENV=(
+    "DASHBOARD_PORT=$DASHBOARD_PORT"
+    "LISTEN_HOST=$LISTEN_HOST"
+    "TRIGGERED_URL=$TRIGGERED_URL"
+    "TRIGGERED_LOG=$TRIGGERED_LOG"
+    "RESET_DELAY=$RESET_DELAY"
+  )
+  [[ -n "$WEBHOOK_TOKEN" ]] && _DENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
+}
+
+# ── start ─────────────────────────────────────────────────────────────────────
+cmd_start() {
+  section "Starting visual_alert  [mode: $MODE]"
+
+  # Abort if ports are already bound
+  if port_in_use "$PORT"; then
+    fail "Port $PORT already in use — triggered.pl may already be running"
+    say "  Run: ${BOLD}trigctl status${RESET}"
+    exit 1
+  fi
+  if port_in_use "$DASHBOARD_PORT"; then
+    fail "Port $DASHBOARD_PORT already in use — dashboard.pl may already be running"
+    exit 1
+  fi
+
+  build_triggered_env
+  build_dashboard_env
+
+  if [[ "$MODE" == "prod" ]]; then
+    # hypnotoad daemonizes itself; run from APP_DIR so relative paths work
+    info "Starting triggered.pl  (hypnotoad)"
+    ( cd "$APP_DIR" && env "${_TENV[@]}" hypnotoad triggered.pl )
+    sleep 0.5
+    local t_pid
+    t_pid="$(pgrep -n -f "perl.*triggered\.pl" 2>/dev/null || true)"
+    [[ -n "$t_pid" ]] && save_pid triggered "$t_pid"
+
+    info "Starting dashboard.pl  (hypnotoad)"
+    ( cd "$APP_DIR" && env "${_DENV[@]}" hypnotoad dashboard.pl )
+    sleep 0.5
+    local d_pid
+    d_pid="$(pgrep -n -f "perl.*dashboard\.pl" 2>/dev/null || true)"
+    [[ -n "$d_pid" ]] && save_pid dashboard "$d_pid"
+  else
+    # Dev mode: background perl daemon, capture PID
+    info "Starting triggered.pl  (daemon)"
+    ( cd "$APP_DIR" && env "${_TENV[@]}" perl triggered.pl daemon \
+        >> "$APP_DIR/.trigctl-triggered.log" 2>&1 ) &
+    save_pid triggered $!
+
+    info "Starting dashboard.pl  (daemon)"
+    ( cd "$APP_DIR" && env "${_DENV[@]}" perl dashboard.pl daemon \
+        >> "$APP_DIR/.trigctl-dashboard.log" 2>&1 ) &
+    save_pid dashboard $!
+  fi
+
+  # Wait for both servers to answer before declaring success
+  info "Waiting for servers to be ready…"
+  local t_ok=false d_ok=false
+
+  if wait_ready "http://127.0.0.1:${PORT}/"; then
+    t_ok=true
+    ok "triggered.pl  →  http://${LISTEN_HOST}:${PORT}"
+  else
+    fail "triggered.pl did not start in time  (log: $LOG_FILE)"
+  fi
+
+  if wait_ready "http://127.0.0.1:${DASHBOARD_PORT}/api/ping"; then
+    d_ok=true
+    ok "dashboard.pl  →  http://${LISTEN_HOST}:${DASHBOARD_PORT}"
+  else
+    fail "dashboard.pl did not start in time"
+  fi
+
+  echo
+  $t_ok && $d_ok && say "${BOLD}${GREEN}Both servers are up.${RESET}" || say "${YELLOW}One or more servers failed to start.${RESET}"
+  [[ -z "$WEBHOOK_TOKEN" ]] && warn "WEBHOOK_TOKEN is not set — /webhook and /reset are unauthenticated"
+}
+
+# ── stop ──────────────────────────────────────────────────────────────────────
+cmd_stop() {
+  section "Stopping visual_alert"
+
+  for name in triggered dashboard; do
+    local pid
+    pid="$(get_pid "$name")"
+
+    if [[ -z "$pid" ]]; then
+      warn "${name}.pl  not running"
+      continue
+    fi
+
+    if [[ "$MODE" == "prod" ]]; then
+      # Ask hypnotoad master to shut down gracefully (SIGQUIT drains workers)
+      kill -QUIT "$pid" 2>/dev/null && ok "${name}.pl  (PID $pid) stopped" \
+        || fail "Could not stop ${name}.pl  (PID $pid)"
+    else
+      kill "$pid" 2>/dev/null && ok "${name}.pl  (PID $pid) stopped" \
+        || fail "Could not stop ${name}.pl  (PID $pid)"
+    fi
+
+    rm -f "$PID_DIR/${name}.pid"
+  done
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+cmd_status() {
+  section "visual_alert status"
+  echo
+
+  # triggered.pl
+  local t_pid
+  t_pid="$(get_pid triggered)"
+  if [[ -n "$t_pid" ]]; then
+    local code clients
+    code="$(http_code "http://127.0.0.1:${PORT}/")"
+    clients="$(conn_count "$PORT")"
+    if [[ "$code" =~ ^[23] ]]; then
+      ok "triggered.pl   PID ${DIM}${t_pid}${RESET}  HTTP ${GREEN}${code}${RESET}  clients: ${BOLD}${clients}${RESET}"
+    else
+      warn "triggered.pl   PID ${DIM}${t_pid}${RESET}  HTTP ${YELLOW}${code}${RESET}  (not responding)"
+    fi
+  else
+    fail "triggered.pl   not running"
+  fi
+
+  # dashboard.pl
+  local d_pid
+  d_pid="$(get_pid dashboard)"
+  if [[ -n "$d_pid" ]]; then
+    local code
+    code="$(http_code "http://127.0.0.1:${DASHBOARD_PORT}/api/ping")"
+    if [[ "$code" =~ ^[23] ]]; then
+      ok "dashboard.pl   PID ${DIM}${d_pid}${RESET}  HTTP ${GREEN}${code}${RESET}"
+    else
+      warn "dashboard.pl   PID ${DIM}${d_pid}${RESET}  HTTP ${YELLOW}${code}${RESET}  (not responding)"
+    fi
+  else
+    fail "dashboard.pl   not running"
+  fi
+
+  # Current alert state (first SSE event is sent immediately on connect)
+  if [[ -n "$t_pid" ]]; then
+    local state_json color
+    state_json="$(curl -s --max-time 1 \
+      "http://127.0.0.1:${PORT}/events" 2>/dev/null \
+      | grep '^data:' | head -1 | sed 's/^data: //')"
+    if [[ -n "$state_json" ]]; then
+      color="$(echo "$state_json" | grep -o '"color":"[^"]*"' | cut -d'"' -f4)"
+      case "$color" in
+        red)   say "\n  Alert state:  ${RED}${BOLD}ALERT${RESET}" ;;
+        green) say "\n  Alert state:  ${GREEN}OK${RESET}" ;;
+      esac
+    fi
+  fi
+
+  echo
+  say "  Alert server:  ${CYAN}http://${LISTEN_HOST}:${PORT}${RESET}"
+  say "  Dashboard:     ${CYAN}http://${LISTEN_HOST}:${DASHBOARD_PORT}${RESET}"
+  say "  Mode:          ${MODE}"
+}
+
+# ── reload (zero-downtime, prod only) ─────────────────────────────────────────
+cmd_reload() {
+  if [[ "$MODE" != "prod" ]]; then
+    fail "reload is only supported in prod mode"
+    say "  Use ${BOLD}trigctl restart${RESET} in dev mode."
+    exit 1
+  fi
+  section "Reloading (zero-downtime)"
+  build_triggered_env
+  build_dashboard_env
+  ( cd "$APP_DIR" && env "${_TENV[@]}" hypnotoad triggered.pl ) && ok "triggered.pl reloaded"
+  ( cd "$APP_DIR" && env "${_DENV[@]}" hypnotoad dashboard.pl ) && ok "dashboard.pl reloaded"
+}
+
+# ── restart ───────────────────────────────────────────────────────────────────
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+# ── logs ──────────────────────────────────────────────────────────────────────
+cmd_logs() {
+  local target="${1:-}"
+  case "$target" in
+    triggered)
+      say "Tailing ${BOLD}${LOG_FILE}${RESET}  (Ctrl-C to stop)"
+      tail -f "$LOG_FILE"
+      ;;
+    dashboard)
+      say "Tailing ${BOLD}${DASHBOARD_LOG}${RESET}  (Ctrl-C to stop)"
+      tail -f "$DASHBOARD_LOG" "$APP_DIR/.trigctl-dashboard.log" 2>/dev/null || \
+        tail -f "$DASHBOARD_LOG"
+      ;;
+    *)
+      say "Tailing both logs  (Ctrl-C to stop)"
+      tail -f "$LOG_FILE" "$DASHBOARD_LOG" \
+        "$APP_DIR/.trigctl-triggered.log" "$APP_DIR/.trigctl-dashboard.log" 2>/dev/null || \
+        tail -f "$LOG_FILE"
+      ;;
+  esac
+}
+
+# ── trigger (fire a test webhook) ─────────────────────────────────────────────
+cmd_trigger() {
+  local camera="${1:-}"
+  local body='{}'
+  [[ -n "$camera" ]] && body="{\"camera\":\"${camera}\"}"
+
+  local curl_args=(-s -X POST -H "Content-Type: application/json" -d "$body")
+  [[ -n "$WEBHOOK_TOKEN" ]] && curl_args+=(-H "Authorization: Bearer $WEBHOOK_TOKEN")
+  curl_args+=("http://127.0.0.1:${PORT}/webhook")
+
+  curl "${curl_args[@]}"
+  echo
+}
+
+# ── reset (clear alert via API) ───────────────────────────────────────────────
+cmd_reset() {
+  local curl_args=(-s -X POST)
+  [[ -n "$WEBHOOK_TOKEN" ]] && curl_args+=(-H "Authorization: Bearer $WEBHOOK_TOKEN")
+  curl_args+=("http://127.0.0.1:${PORT}/reset")
+  curl "${curl_args[@]}"
+  echo
+}
+
+# ── help ──────────────────────────────────────────────────────────────────────
+cmd_help() {
+  cat <<EOF
+
+${BOLD}trigctl${RESET} — visual_alert control script
+
+${BOLD}USAGE${RESET}
+  trigctl <command> [--prod|--dev] [KEY=VALUE ...]
+
+${BOLD}COMMANDS${RESET}
+  start   [--prod|--dev]       Start triggered.pl and dashboard.pl
+  stop                         Stop both servers
+  restart [--prod|--dev]       Stop then start
+  status                       Process state, HTTP health, client count
+  logs    [triggered|dashboard] Tail log output (default: both)
+  reload                       Zero-downtime hypnotoad reload (prod only)
+  trigger [camera name]        POST to /webhook with configured token
+  reset                        POST to /reset (clear alert)
+  help                         Show this help
+
+${BOLD}MODES${RESET}
+  --dev   perl daemon (default) — single process, auto-reloads on source change
+  --prod  hypnotoad             — production-grade, prefork, graceful restarts
+
+${BOLD}VARIABLES${RESET}  (pass as KEY=VALUE args, or set in .trigctl.env)
+  LISTEN_HOST     Bind address              (default: 127.0.0.1)
+  PORT            triggered.pl port         (default: 3000)
+  DASHBOARD_PORT  dashboard.pl port         (default: 3001)
+  WEBHOOK_TOKEN   Bearer auth token
+  RESET_DELAY     Auto-reset seconds        (default: 60)
+  LOG_FILE        triggered log path        (default: ./triggered.log)
+  DASHBOARD_LOG   dashboard log path        (default: ./dashboard.log)
+  ALERT_SOUND     Audio file path
+  TRIGGERED_URL   Override alert server URL for dashboard
+
+${BOLD}CONFIG FILE${RESET}
+  ${APP_DIR}/.trigctl.env
+  Variables here are loaded as defaults on every invocation.
+  CLI KEY=VALUE args override them.
+
+  Example .trigctl.env:
+    WEBHOOK_TOKEN=mysecret
+    LISTEN_HOST=0.0.0.0
+    RESET_DELAY=30
+
+${BOLD}EXAMPLES${RESET}
+  trigctl start WEBHOOK_TOKEN=secret LISTEN_HOST=0.0.0.0
+  trigctl start --prod
+  trigctl status
+  trigctl logs triggered
+  trigctl trigger "Front Door"
+  trigctl reset
+  trigctl stop
+
+${BOLD}SETUP${RESET}
+  chmod +x trigctl
+  ln -sf ${APP_DIR}/trigctl ~/bin/trigctl   # add to PATH
+
+EOF
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+case "$CMD" in
+  start)          cmd_start ;;
+  stop)           cmd_stop ;;
+  restart)        cmd_restart ;;
+  status)         cmd_status ;;
+  reload)         cmd_reload ;;
+  logs)           cmd_logs    "${POSITIONAL[@]+"${POSITIONAL[@]}"}" ;;
+  trigger)        cmd_trigger "${POSITIONAL[@]+"${POSITIONAL[@]}"}" ;;
+  reset)          cmd_reset ;;
+  help|--help|-h) cmd_help ;;
+  *)              fail "Unknown command: $CMD"; cmd_help; exit 1 ;;
+esac
