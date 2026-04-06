@@ -280,7 +280,7 @@ curl http://127.0.0.1:3001/api/ping
 1. Configure `.trigctl.env` for LAN access and start:
    ```
    LISTEN_HOST=0.0.0.0
-   WEBHOOK_TOKEN=secret
+   WEBHOOK_TOKEN=webhook_token
    ```
    ```bash
    trigctl start
@@ -290,12 +290,11 @@ curl http://127.0.0.1:3001/api/ping
 
    | Field | Value |
    |---|---|
-   | **Method** | `POST` |
    | **URL** | `http://<alert-server-ip>:3000/webhook` |
-   | **Header** | `Authorization: Bearer secret` |
-   | **Body** | `{"camera":"&CAM"}` |
+   | **Post/Payload** | `camera:&CAM` |
+   | **Add HTTP Headers** | `Authorization: Bearer webhook_token` |
 
-3. Open `http://<alert-server-ip>:3000` (or the dashboard at `:3001`) on any browser, TV, or secondary monitor you want to act as a silent sentry display.
+4. Open `http://<alert-server-ip>:3000` (or the dashboard at `:3001`) on any browser, TV, or secondary monitor you want to act as a silent sentry display.
 
 **How it works:**
 
@@ -313,9 +312,9 @@ Add a second Web request action under **On alert end…**:
 
 | Field | Value |
 |---|---|
-| **Method** | `POST` |
 | **URL** | `http://<alert-server-ip>:3000/reset` |
-| **Header** | `Authorization: Bearer secret` |
+| **Post/Payload** | `camera:&CAM` |
+| **Add HTTP Headers** | `Authorization: Bearer webhook_token` |
 
 This clears the screen the moment Blue Iris considers the motion event over, rather than waiting for the countdown.
 
