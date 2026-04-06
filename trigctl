@@ -42,6 +42,10 @@ APP_DIR="$SCRIPT_DIR"
 PID_DIR="$APP_DIR/.pids"
 CONFIG_FILE="$APP_DIR/.trigctl.env"
 
+# ── Setup marker & local-lib path ────────────────────────────────────────────
+SETUP_MARKER="$APP_DIR/.setup-done"
+LOCAL_LIB="$APP_DIR/local"
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 LISTEN_HOST="127.0.0.1"
 PORT="3000"
@@ -82,6 +86,11 @@ for arg in "$@"; do
     *) POSITIONAL+=("$arg") ;;
   esac
 done
+
+# Prepend local-lib to PERL5LIB so installed deps are found automatically
+if [[ -d "$LOCAL_LIB/lib/perl5" ]]; then
+  export PERL5LIB="$LOCAL_LIB/lib/perl5${PERL5LIB:+:$PERL5LIB}"
+fi
 
 # Resolve relative log paths against APP_DIR
 [[ "$LOG_FILE"      != /* ]] && LOG_FILE="$APP_DIR/${LOG_FILE#./}"
@@ -215,6 +224,13 @@ master_pid_for_port() {
 # ── start ─────────────────────────────────────────────────────────────────────
 cmd_start() {
   section "Starting visual_alert  [mode: $MODE]"
+
+  # Dependency guard — fast perl one-liner, no subprocess overhead
+  if ! perl -MMojolicious -e1 2>/dev/null; then
+    fail "Mojolicious not found"
+    say "  Run: ${BOLD}trigctl setup${RESET}  to install dependencies"
+    exit 1
+  fi
 
   # Abort if ports are already bound
   if port_in_use "$PORT"; then
@@ -449,6 +465,8 @@ ${BOLD}USAGE${RESET}
   trigctl <command> [--prod|--dev] [KEY=VALUE ...]
 
 ${BOLD}COMMANDS${RESET}
+  setup   [--force]            Install Perl dependencies (local-lib), validate
+  doctor                       Pre-flight diagnostics — checks without starting
   start   [--prod|--dev]       Start triggered.pl and dashboard.pl
   stop                         Stop both servers
   restart [--prod|--dev]       Stop then start
@@ -464,15 +482,23 @@ ${BOLD}MODES${RESET}
   --prod  hypnotoad             — production-grade, prefork, graceful restarts
 
 ${BOLD}VARIABLES${RESET}  (pass as KEY=VALUE args, or set in .trigctl.env)
-  LISTEN_HOST     Bind address              (default: 127.0.0.1)
-  PORT            triggered.pl port         (default: 3000)
-  DASHBOARD_PORT  dashboard.pl port         (default: 3001)
-  WEBHOOK_TOKEN   Bearer auth token
-  RESET_DELAY     Auto-reset seconds        (default: 60)
-  LOG_FILE        triggered log path        (default: ./triggered.log)
-  DASHBOARD_LOG   dashboard log path        (default: ./dashboard.log)
-  ALERT_SOUND     Audio file path
-  TRIGGERED_URL   Override alert server URL for dashboard
+  LISTEN_HOST          Bind address              (default: 127.0.0.1)
+  PORT                 triggered.pl port         (default: 3000)
+  DASHBOARD_PORT       dashboard.pl port         (default: 3001)
+  WEBHOOK_TOKEN        Bearer auth token
+  RESET_DELAY          Auto-reset seconds        (default: 60)
+  LOG_FILE             triggered log path        (default: ./triggered.log)
+  DASHBOARD_LOG        dashboard log path        (default: ./dashboard.log)
+  ALERT_SOUND          Audio file path
+  TRIGGERED_URL        Override alert server URL for dashboard
+  NOTIFY_URL           Push URL (ntfy.sh / Slack / Discord / generic)
+  NOTIFY_ON_RESET      Set 1 to notify on clear too
+  CAMERA_ALLOW         Comma-separated camera allow-list
+  CAMERA_IGNORE        Comma-separated camera ignore-list
+  QUIET_START          Quiet hours start HH:MM 24h (e.g. 22:00)
+  QUIET_END            Quiet hours end   HH:MM 24h (e.g. 07:00)
+  SNAPSHOT_TTL         Seconds before snapshots expire  (default: 300)
+  SNAPSHOT_MAX_BYTES   Max snapshot upload size         (default: 2097152)
 
 ${BOLD}CONFIG FILE${RESET}
   ${APP_DIR}/.trigctl.env
@@ -485,6 +511,8 @@ ${BOLD}CONFIG FILE${RESET}
     RESET_DELAY=30
 
 ${BOLD}EXAMPLES${RESET}
+  trigctl setup                          # first-time install
+  trigctl doctor                         # pre-flight check
   trigctl start WEBHOOK_TOKEN=secret LISTEN_HOST=0.0.0.0
   trigctl start --prod
   trigctl status
@@ -500,8 +528,228 @@ ${BOLD}SETUP${RESET}
 EOF
 }
 
+# ── setup ─────────────────────────────────────────────────────────────────────
+cmd_setup() {
+  local force=false
+  [[ "${1:-}" == "--force" ]] && force=true
+
+  section "visual_alert setup"
+
+  if [[ -f "$SETUP_MARKER" ]] && ! $force; then
+    ok "Dependencies already installed  (run ${BOLD}trigctl setup --force${RESET} to reinstall)"
+    return 0
+  fi
+
+  # Locate cpanm
+  local cpanm_bin
+  cpanm_bin="$(command -v cpanm 2>/dev/null || true)"
+  if [[ -z "$cpanm_bin" ]]; then
+    warn "cpanm not found in PATH"
+    info "Attempting to bootstrap cpanm via cpanmin.us…"
+    if ! curl -s -L https://cpanmin.us | perl - App::cpanminus --local-lib "$LOCAL_LIB"; then
+      fail "cpanm bootstrap failed — please install cpanminus manually:"
+      say "  curl -L https://cpanmin.us | perl - App::cpanminus"
+      exit 1
+    fi
+    cpanm_bin="$LOCAL_LIB/bin/cpanm"
+    ok "cpanm bootstrapped at $cpanm_bin"
+  else
+    ok "cpanm found: $cpanm_bin"
+  fi
+
+  info "Installing dependencies to $LOCAL_LIB  (this may take a minute)…"
+  if ( cd "$APP_DIR" && "$cpanm_bin" --local-lib "$LOCAL_LIB" --installdeps . ); then
+    ok "Dependencies installed"
+  else
+    fail "Dependency installation failed — check output above"
+    exit 1
+  fi
+
+  # Ensure local-lib is on PERL5LIB for the validation checks below
+  export PERL5LIB="$LOCAL_LIB/lib/perl5${PERL5LIB:+:$PERL5LIB}"
+
+  # Validate
+  info "Validating…"
+  local all_ok=true
+
+  if perl -MMojolicious -e 'print Mojolicious->VERSION' 2>/dev/null | grep -q .; then
+    ok "Mojolicious $(perl -MMojolicious -e 'print Mojolicious->VERSION' 2>/dev/null)"
+  else
+    fail "Mojolicious not loadable after install"
+    all_ok=false
+  fi
+
+  if command -v hypnotoad &>/dev/null; then
+    ok "hypnotoad: $(command -v hypnotoad)"
+  else
+    local hpath="$LOCAL_LIB/bin/hypnotoad"
+    if [[ -x "$hpath" ]]; then
+      ok "hypnotoad: $hpath"
+    else
+      warn "hypnotoad not found in PATH or $LOCAL_LIB/bin — prod mode unavailable"
+    fi
+  fi
+
+  if perl -c "$APP_DIR/triggered.pl" &>/dev/null; then
+    ok "triggered.pl syntax OK"
+  else
+    fail "triggered.pl has syntax errors:"
+    perl -c "$APP_DIR/triggered.pl" 2>&1 | head -5
+    all_ok=false
+  fi
+
+  if perl -c "$APP_DIR/dashboard.pl" &>/dev/null; then
+    ok "dashboard.pl syntax OK"
+  else
+    fail "dashboard.pl has syntax errors:"
+    perl -c "$APP_DIR/dashboard.pl" 2>&1 | head -5
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    date > "$SETUP_MARKER"
+    echo
+    say "${BOLD}${GREEN}Setup complete.${RESET}  Run ${BOLD}trigctl start${RESET} to launch."
+  else
+    fail "Setup completed with errors — resolve issues before starting"
+    exit 1
+  fi
+}
+
+# ── doctor ────────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  section "visual_alert doctor  (read-only checks)"
+  echo
+
+  local issues=0
+
+  _chk() {
+    local label="$1" status="$2" detail="${3:-}"
+    if [[ "$status" == "ok" ]]; then
+      ok "$(printf '%-30s' "$label")${detail:+  ${DIM}${detail}${RESET}}"
+    elif [[ "$status" == "warn" ]]; then
+      warn "$(printf '%-30s' "$label")${detail:+  ${DIM}${detail}${RESET}}"
+    else
+      fail "$(printf '%-30s' "$label")${detail:+  ${DIM}${detail}${RESET}}"
+      (( issues++ )) || true
+    fi
+  }
+
+  # Perl version
+  local perl_ver
+  perl_ver="$(perl -e 'printf "%vd", $^V' 2>/dev/null || echo 'unknown')"
+  if perl -e 'die unless $] >= 5.020' 2>/dev/null; then
+    _chk "Perl >= 5.20" ok "$perl_ver"
+  else
+    _chk "Perl >= 5.20" fail "$perl_ver (need 5.20+)"
+  fi
+
+  # Mojolicious
+  local mojo_ver
+  mojo_ver="$(perl -MMojolicious -e 'print Mojolicious->VERSION' 2>/dev/null || echo '')"
+  if [[ -n "$mojo_ver" ]]; then
+    _chk "Mojolicious" ok "$mojo_ver"
+  else
+    _chk "Mojolicious" fail "not installed — run: trigctl setup"
+  fi
+
+  # hypnotoad
+  if command -v hypnotoad &>/dev/null; then
+    _chk "hypnotoad (prod mode)" ok "$(command -v hypnotoad)"
+  elif [[ -x "$LOCAL_LIB/bin/hypnotoad" ]]; then
+    _chk "hypnotoad (prod mode)" ok "$LOCAL_LIB/bin/hypnotoad"
+  else
+    _chk "hypnotoad (prod mode)" warn "not in PATH (dev mode still works)"
+  fi
+
+  # cpanm
+  if command -v cpanm &>/dev/null; then
+    _chk "cpanm" ok "$(command -v cpanm)"
+  else
+    _chk "cpanm" warn "not in PATH (needed for: trigctl setup)"
+  fi
+
+  # .trigctl.env
+  if [[ -f "$CONFIG_FILE" ]]; then
+    _chk ".trigctl.env" ok "$CONFIG_FILE"
+  else
+    _chk ".trigctl.env" warn "not found — defaults will be used"
+  fi
+
+  # WEBHOOK_TOKEN
+  if [[ -n "$WEBHOOK_TOKEN" ]]; then
+    _chk "WEBHOOK_TOKEN" ok "set"
+  else
+    _chk "WEBHOOK_TOKEN" warn "not set — endpoints are open"
+  fi
+
+  # Ports
+  if port_in_use "$PORT"; then
+    local t_pid; t_pid="$(get_pid triggered)"
+    if [[ -n "$t_pid" ]]; then
+      _chk "Port $PORT (triggered.pl)" ok "listening (our process)"
+    else
+      _chk "Port $PORT (triggered.pl)" warn "in use by another process"
+    fi
+  else
+    _chk "Port $PORT (triggered.pl)" ok "free"
+  fi
+
+  if port_in_use "$DASHBOARD_PORT"; then
+    local d_pid; d_pid="$(get_pid dashboard)"
+    if [[ -n "$d_pid" ]]; then
+      _chk "Port $DASHBOARD_PORT (dashboard.pl)" ok "listening (our process)"
+    else
+      _chk "Port $DASHBOARD_PORT (dashboard.pl)" warn "in use by another process"
+    fi
+  else
+    _chk "Port $DASHBOARD_PORT (dashboard.pl)" ok "free"
+  fi
+
+  # Log file writability
+  local log_dir; log_dir="$(dirname "$LOG_FILE")"
+  if [[ -w "$log_dir" ]]; then
+    _chk "Log dir writable" ok "$log_dir"
+  else
+    _chk "Log dir writable" fail "$log_dir (not writable)"
+  fi
+
+  # ALERT_SOUND
+  if [[ -n "$ALERT_SOUND" ]]; then
+    if [[ -f "$ALERT_SOUND" ]]; then
+      _chk "ALERT_SOUND file" ok "$ALERT_SOUND"
+    else
+      _chk "ALERT_SOUND file" fail "not found: $ALERT_SOUND"
+    fi
+  else
+    _chk "ALERT_SOUND" ok "not configured (silent)"
+  fi
+
+  # Perl syntax checks
+  if perl -c "$APP_DIR/triggered.pl" &>/dev/null; then
+    _chk "triggered.pl syntax" ok
+  else
+    _chk "triggered.pl syntax" fail "$(perl -c "$APP_DIR/triggered.pl" 2>&1 | head -1)"
+  fi
+
+  if perl -c "$APP_DIR/dashboard.pl" &>/dev/null; then
+    _chk "dashboard.pl syntax" ok
+  else
+    _chk "dashboard.pl syntax" fail "$(perl -c "$APP_DIR/dashboard.pl" 2>&1 | head -1)"
+  fi
+
+  echo
+  if (( issues == 0 )); then
+    say "${BOLD}${GREEN}All checks passed.${RESET}"
+  else
+    say "${YELLOW}${issues} issue(s) found — review above before starting.${RESET}"
+  fi
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 case "$CMD" in
+  setup)          cmd_setup   "${POSITIONAL[@]+"${POSITIONAL[@]}"}" ;;
+  doctor)         cmd_doctor ;;
   start)          cmd_start ;;
   stop)           cmd_stop ;;
   restart)        cmd_restart ;;

@@ -11,9 +11,10 @@
 #   WEBHOOK_TOKEN   — bearer token (same as triggered.pl, optional)
 #
 # Endpoints:
-#   GET /                — React dashboard page
-#   GET /api/log-stream  — SSE stream of triggered.pl log file (tail)
-#   GET /api/ping        — health check JSON
+#   GET /                      — React dashboard page
+#   GET /api/log-stream        — SSE stream of triggered.pl log file (tail)
+#   GET /api/ping              — health check JSON
+#   GET /api/snapshot/:camera  — proxy snapshot image from triggered.pl
 #
 # The React frontend connects directly to triggered.pl's /events SSE endpoint
 # for live alert status, and to /api/log-stream here for the log tail.
@@ -23,6 +24,7 @@ use 5.020;
 use Mojolicious::Lite;
 use Mojo::IOLoop;
 use Mojo::JSON qw(encode_json);
+use Mojo::UserAgent;
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,6 +63,35 @@ get '/api/ping' => sub {
 };
 
 # ---------------------------------------------------------------------------
+# Snapshot proxy — fetches from triggered.pl and re-serves on same origin
+# so the React frontend never makes a cross-origin image request.
+# ---------------------------------------------------------------------------
+
+get '/api/snapshot/:camera' => sub {
+    my $c   = shift;
+    my $cam = $c->param('camera') // '';
+    $cam =~ s/[^A-Za-z0-9_\-\s]//g;
+    $cam = substr($cam, 0, 64);
+
+    my $ua = Mojo::UserAgent->new;
+    $ua->connect_timeout(3)->request_timeout(5);
+
+    my $tx = $ua->get("$triggered_url/snapshot/$cam");
+
+    if ($tx->result->is_success) {
+        my $res = $tx->result;
+        my $ct  = $res->headers->content_type // 'image/jpeg';
+        my $ts  = $res->headers->header('X-Snapshot-Ts') // '';
+        $c->res->headers->content_type($ct);
+        $c->res->headers->cache_control('no-cache, no-store');
+        $c->res->headers->header('X-Snapshot-Ts' => $ts) if $ts;
+        $c->render(data => $res->body);
+    } else {
+        $c->reply->not_found;
+    }
+};
+
+# ---------------------------------------------------------------------------
 # SSE log tail — sends last 100 lines on connect, then follows new writes
 # ---------------------------------------------------------------------------
 
@@ -71,7 +102,6 @@ get '/api/log-stream' => sub {
     $c->res->headers->content_type('text/event-stream');
     $c->res->headers->cache_control('no-cache');
 
-    # If log file doesn't exist yet, poll until it appears
     unless (-e $log_file) {
         $c->write("data: " . encode_json({
             type => 'system',
@@ -100,7 +130,6 @@ get '/api/log-stream' => sub {
             return;
         };
 
-    # Send last 100 lines as history so the viewer isn't empty on connect
     my @all = <$fh>;
     my $start = @all > 100 ? @all - 100 : 0;
     for my $i ($start .. $#all) {
@@ -113,7 +142,6 @@ get '/api/log-stream' => sub {
         }) . "\n\n");
     }
 
-    # Seek to end and tail new lines every 500 ms
     seek $fh, 0, 2;
 
     my $tail_timer = Mojo::IOLoop->recurring(0.5 => sub {
@@ -140,7 +168,7 @@ get '/api/log-stream' => sub {
 };
 
 # ---------------------------------------------------------------------------
-# Dashboard page — injects server config as JS globals for the React app
+# Dashboard page
 # ---------------------------------------------------------------------------
 
 get '/' => sub {
@@ -195,6 +223,7 @@ __DATA__
       --red:       #ef4444;
       --red-dim:   #7f1d1d;
       --amber:     #f59e0b;
+      --amber-dim: #78350f;
       --blue:      #3b82f6;
       --cyan:      #06b6d4;
       --radius:    8px;
@@ -213,15 +242,14 @@ __DATA__
     /* ── Layout ─────────────────────────────────────────── */
     .layout {
       display: grid;
-      grid-template-rows: auto 1fr auto;
       grid-template-columns: 1fr 260px;
       grid-template-areas:
-        "header  header"
-        "main    sidebar"
-        "log     log";
+        "header   header"
+        "main     sidebar"
+        "log      log"
+        "history  history";
       gap: 12px;
       padding: 12px;
-      height: 100%;
       min-height: 100vh;
     }
 
@@ -232,7 +260,8 @@ __DATA__
           "header"
           "main"
           "sidebar"
-          "log";
+          "log"
+          "history";
       }
     }
 
@@ -261,14 +290,8 @@ __DATA__
       justify-content: space-between;
     }
 
-    .header-title {
-      font-size: 16px;
-      font-weight: 700;
-      letter-spacing: 0.03em;
-    }
-
+    .header-title { font-size: 16px; font-weight: 700; letter-spacing: 0.03em; }
     .header-title span { color: var(--muted); font-weight: 400; margin-left: 6px; font-size: 13px; }
-
     .clock { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
 
     /* ── Status panel ────────────────────────────────────── */
@@ -289,184 +312,173 @@ __DATA__
       transition: background 0.4s ease, box-shadow 0.4s ease;
     }
 
-    .orb-green {
-      background: var(--green);
-      box-shadow: 0 0 30px rgba(34,197,94,0.4);
-    }
-
-    .orb-red {
-      background: var(--red);
-      animation: pulse-red 1.4s ease-in-out infinite;
-    }
-
-    .orb-unknown {
-      background: var(--border);
-    }
+    .orb-green   { background: var(--green);  box-shadow: 0 0 30px rgba(34,197,94,0.4); }
+    .orb-red     { background: var(--red);    animation: pulse-red 1.4s ease-in-out infinite; }
+    .orb-amber   { background: var(--amber);  animation: pulse-amber 1.8s ease-in-out infinite; }
+    .orb-unknown { background: var(--border); }
 
     @keyframes pulse-red {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.5); }
+      0%, 100% { box-shadow: 0 0 0 0   rgba(239,68,68,0.5); }
       50%       { box-shadow: 0 0 0 24px rgba(239,68,68,0); }
     }
-
-    .status-label {
-      font-size: 3rem;
-      font-weight: 800;
-      letter-spacing: 0.06em;
-      transition: color 0.4s ease;
+    @keyframes pulse-amber {
+      0%, 100% { box-shadow: 0 0 0 0   rgba(245,158,11,0.5); }
+      50%       { box-shadow: 0 0 0 20px rgba(245,158,11,0); }
     }
 
+    .status-label { font-size: 3rem; font-weight: 800; letter-spacing: 0.06em; transition: color 0.4s ease; }
     .label-green   { color: var(--green); }
     .label-red     { color: var(--red); }
+    .label-amber   { color: var(--amber); }
     .label-unknown { color: var(--muted); }
 
-    .status-camera {
-      font-size: 1rem;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      min-height: 1.4em;
-      transition: color 0.4s ease;
+    .status-quiet-badge {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      background: rgba(245,158,11,0.15);
+      color: var(--amber);
+      border: 1px solid rgba(245,158,11,0.3);
+      border-radius: 99px;
+      padding: 2px 10px;
     }
-    .status-camera.cam-red   { color: #fca5a5; }
-    .status-camera.cam-green { color: var(--muted); }
 
-    .status-countdown {
-      font-size: 1rem;
-      color: var(--muted);
-      min-height: 1.4em;
-      font-variant-numeric: tabular-nums;
-    }
+    .status-camera { font-size: 1rem; font-weight: 600; letter-spacing: 0.04em; min-height: 1.4em; }
+    .cam-red   { color: #fca5a5; }
+    .cam-amber { color: #fcd34d; }
+    .cam-green { color: var(--muted); }
+
+    .status-countdown { font-size: 1rem; color: var(--muted); min-height: 1.4em; font-variant-numeric: tabular-nums; }
 
     .sound-btn {
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--muted);
-      font-size: 1rem;
-      padding: 4px 10px;
-      cursor: pointer;
-      line-height: 1;
+      background: none; border: 1px solid var(--border); border-radius: 6px;
+      color: var(--muted); font-size: 1rem; padding: 4px 10px; cursor: pointer; line-height: 1;
     }
     .sound-btn:hover { border-color: var(--text); color: var(--text); }
 
     /* ── Sidebar ─────────────────────────────────────────── */
     .sidebar { grid-area: sidebar; display: flex; flex-direction: column; gap: 12px; }
 
-    .conn-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 4px 0;
-      font-size: 13px;
-    }
-
+    .conn-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; font-size: 13px; }
     .conn-label { color: var(--muted); }
 
     .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      font-size: 11px;
-      font-weight: 600;
-      padding: 2px 8px;
-      border-radius: 99px;
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 99px;
     }
+    .badge::before { content: ''; display: block; width: 6px; height: 6px; border-radius: 50%; }
 
-    .badge::before {
-      content: '';
-      display: block;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-    }
-
-    .badge-connected    { background: rgba(34,197,94,0.15);  color: var(--green); }
-    .badge-connected::before { background: var(--green); }
-    .badge-connecting   { background: rgba(245,158,11,0.15); color: var(--amber); }
-    .badge-connecting::before { background: var(--amber); animation: blink 1s step-end infinite; }
-    .badge-disconnected { background: rgba(239,68,68,0.15);  color: var(--red); }
+    .badge-connected::before    { background: var(--green); }
+    .badge-connected            { background: rgba(34,197,94,0.15);  color: var(--green); }
+    .badge-connecting::before   { background: var(--amber); animation: blink 1s step-end infinite; }
+    .badge-connecting           { background: rgba(245,158,11,0.15); color: var(--amber); }
     .badge-disconnected::before { background: var(--red); }
+    .badge-disconnected         { background: rgba(239,68,68,0.15);  color: var(--red); }
 
     @keyframes blink { 50% { opacity: 0; } }
 
     .cmd-block {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 10px 12px;
-      font-family: ui-monospace, 'Cascadia Code', monospace;
-      font-size: 12px;
-      color: var(--cyan);
-      line-height: 1.8;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; font-family: ui-monospace, 'Cascadia Code', monospace;
+      font-size: 12px; color: var(--cyan); line-height: 1.8;
     }
-
     .cmd-comment { color: var(--muted); }
+
+    /* ── Snapshot viewer ─────────────────────────────────── */
+    .snapshot-card { padding: 12px; }
+
+    .snapshot-tabs {
+      display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px;
+    }
+    .snap-tab {
+      background: none; border: 1px solid var(--border); border-radius: 4px;
+      color: var(--muted); font-size: 11px; padding: 2px 8px; cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+      white-space: nowrap; max-width: 100px; overflow: hidden; text-overflow: ellipsis;
+    }
+    .snap-tab.active { border-color: var(--amber); color: var(--amber); }
+    .snap-tab:hover  { border-color: var(--text);  color: var(--text); }
+
+    .snapshot-img {
+      width: 100%; aspect-ratio: 4/3; object-fit: cover;
+      border-radius: 4px; border: 1px solid var(--border);
+      display: block; background: var(--bg);
+    }
+    .snapshot-ts {
+      font-size: 10px; color: var(--muted); margin-top: 5px; text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
 
     /* ── Log viewer ──────────────────────────────────────── */
     .log-card { grid-area: log; display: flex; flex-direction: column; max-height: 320px; }
 
-    .log-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 10px;
-      flex-shrink: 0;
-    }
-
+    .log-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; flex-shrink: 0; }
     .log-controls { display: flex; gap: 8px; align-items: center; }
 
     .toggle-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--muted);
-      font-size: 12px;
-      padding: 3px 10px;
-      cursor: pointer;
-      transition: border-color 0.15s, color 0.15s;
+      display: inline-flex; align-items: center; gap: 5px; background: none;
+      border: 1px solid var(--border); border-radius: 6px; color: var(--muted);
+      font-size: 12px; padding: 3px 10px; cursor: pointer; transition: border-color 0.15s, color 0.15s;
     }
-
     .toggle-btn.active { border-color: var(--blue); color: var(--blue); }
     .toggle-btn:hover  { border-color: var(--text); color: var(--text); }
 
     .clear-btn {
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--muted);
-      font-size: 12px;
-      padding: 3px 10px;
-      cursor: pointer;
+      background: none; border: 1px solid var(--border); border-radius: 6px;
+      color: var(--muted); font-size: 12px; padding: 3px 10px; cursor: pointer;
     }
     .clear-btn:hover { border-color: var(--red); color: var(--red); }
 
     .log-body {
-      flex: 1;
-      overflow-y: auto;
+      flex: 1; overflow-y: auto;
       font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
-      font-size: 12px;
-      line-height: 1.6;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px 12px;
+      font-size: 12px; line-height: 1.6;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;
     }
-
     .log-body::-webkit-scrollbar { width: 6px; }
     .log-body::-webkit-scrollbar-track { background: transparent; }
     .log-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
     .log-line { white-space: pre-wrap; word-break: break-all; padding: 1px 0; }
-    .log-line.historic { opacity: 0.55; }
-    .log-line.lvl-error { color: #fca5a5; }
-    .log-line.lvl-warn  { color: #fcd34d; }
-    .log-line.lvl-debug { color: #67e8f9; }
-    .log-line.lvl-info  { color: var(--text); }
-    .log-line.lvl-system { color: var(--amber); font-style: italic; }
+    .log-line.historic  { opacity: 0.55; }
+    .lvl-error  { color: #fca5a5; }
+    .lvl-warn   { color: #fcd34d; }
+    .lvl-debug  { color: #67e8f9; }
+    .lvl-info   { color: var(--text); }
+    .lvl-system { color: var(--amber); font-style: italic; }
+    .log-empty  { color: var(--muted); font-style: italic; padding: 8px 0; }
 
-    .log-empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+    /* ── History panel ───────────────────────────────────── */
+    .history-card { grid-area: history; }
+
+    .history-list { display: flex; flex-direction: column; gap: 4px; }
+
+    .history-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 5px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      background: var(--bg);
+      border: 1px solid transparent;
+    }
+    .history-row:hover { border-color: var(--border); }
+
+    .history-cam  { font-weight: 600; color: var(--text); truncate: ellipsis; white-space: nowrap; overflow: hidden; }
+    .history-time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+    .history-badge {
+      font-size: 10px; font-weight: 700; padding: 1px 7px;
+      border-radius: 99px; white-space: nowrap;
+    }
+    .hbadge-auto   { background: rgba(34,197,94,0.15);  color: var(--green); }
+    .hbadge-manual { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .hbadge-active { background: rgba(239,68,68,0.15);  color: var(--red); animation: blink 1s step-end infinite; }
+
+    .history-empty { color: var(--muted); font-style: italic; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -483,6 +495,10 @@ function lineLevel(text) {
   if (/\[warn\]/i.test(text))          return 'lvl-warn';
   if (/\[debug\]/i.test(text))         return 'lvl-debug';
   return 'lvl-info';
+}
+
+function fmtTime(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 function ConnectionBadge({ state }) {
@@ -504,16 +520,19 @@ function Clock() {
 
 // ── Status Panel ───────────────────────────────────────────────────────────
 
-function StatusPanel({ color, camera, countdown, connState, soundAvailable, soundMuted, onSoundToggle }) {
-  const orbClass   = color === 'red' ? 'orb-red'   : color === 'green' ? 'orb-green'   : 'orb-unknown';
-  const labelClass = color === 'red' ? 'label-red'  : color === 'green' ? 'label-green' : 'label-unknown';
-  const labelText  = color === 'red' ? 'ALERT'      : color === 'green' ? 'OK'          : '—';
+function StatusPanel({ color, quiet, camera, countdown, connState, soundAvailable, soundMuted, onSoundToggle }) {
+  const isAmber = color === 'red' && quiet;
+  const orbClass   = isAmber ? 'orb-amber'   : color === 'red' ? 'orb-red'   : color === 'green' ? 'orb-green'   : 'orb-unknown';
+  const labelClass = isAmber ? 'label-amber'  : color === 'red' ? 'label-red'  : color === 'green' ? 'label-green' : 'label-unknown';
+  const labelText  = isAmber ? 'QUIET'        : color === 'red' ? 'ALERT'      : color === 'green' ? 'OK'          : '—';
+  const camClass   = isAmber ? 'cam-amber'    : color === 'red' ? 'cam-red'    : 'cam-green';
 
   return (
     <div className="card status-card">
       <div className={`status-orb ${orbClass}`} />
       <div className={`status-label ${labelClass}`}>{labelText}</div>
-      <div className={`status-camera ${color === 'red' ? 'cam-red' : 'cam-green'}`}>
+      {isAmber && <div className="status-quiet-badge">quiet hours active</div>}
+      <div className={`status-camera ${camClass}`}>
         {color === 'red' && camera ? camera : ''}
       </div>
       <div className="status-countdown">
@@ -530,6 +549,144 @@ function StatusPanel({ color, camera, countdown, connState, soundAvailable, soun
             {soundMuted ? '🔇' : '🔊'}
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ── Snapshot Viewer ────────────────────────────────────────────────────────
+
+function SnapshotViewer({ alertColor, cameraName }) {
+  const [cameras,     setCameras]     = useState([]);
+  const [selected,    setSelected]    = useState('');
+  const [imgSrc,      setImgSrc]      = useState('');
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [imgError,    setImgError]    = useState(false);
+  const pollRef = useRef(null);
+
+  // Fetch available camera list whenever alert state changes
+  useEffect(() => {
+    if (alertColor !== 'red') {
+      setCameras([]);
+      setSelected('');
+      setImgSrc('');
+      setLastUpdated(null);
+      return;
+    }
+    const load = () => {
+      fetch(`${CFG.triggeredUrl}/api/snapshots`)
+        .then(r => r.json())
+        .then(d => {
+          const cams = d.cameras || [];
+          setCameras(cams);
+          // Auto-select: prefer current alert camera, else first in list
+          setSelected(prev => {
+            if (prev && cams.includes(prev)) return prev;
+            if (cameraName && cams.includes(cameraName)) return cameraName;
+            return cams[0] || '';
+          });
+        })
+        .catch(() => {});
+    };
+    load();
+    // Re-check camera list every 5 s (new snapshots may arrive)
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
+  }, [alertColor, cameraName]);
+
+  // Poll snapshot image every 2 s while a camera is selected
+  useEffect(() => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    if (!selected) return;
+
+    const refresh = () => {
+      setImgError(false);
+      setImgSrc(`/api/snapshot/${encodeURIComponent(selected)}?t=${Date.now()}`);
+      setLastUpdated(new Date());
+    };
+    refresh();
+    pollRef.current = setInterval(refresh, 2000);
+    return () => clearInterval(pollRef.current);
+  }, [selected]);
+
+  if (alertColor !== 'red' || cameras.length === 0) return null;
+
+  return (
+    <div className="card snapshot-card">
+      <div className="card-title" style={{marginBottom: cameras.length > 1 ? 8 : 12}}>
+        Snapshot
+      </div>
+      {cameras.length > 1 && (
+        <div className="snapshot-tabs">
+          {cameras.map(cam => (
+            <button
+              key={cam}
+              className={`snap-tab ${selected === cam ? 'active' : ''}`}
+              onClick={() => setSelected(cam)}
+              title={cam}
+            >{cam}</button>
+          ))}
+        </div>
+      )}
+      {imgSrc && !imgError ? (
+        <img
+          src={imgSrc}
+          alt={`Snapshot: ${selected}`}
+          className="snapshot-img"
+          onError={() => setImgError(true)}
+        />
+      ) : (
+        <div className="snapshot-img" style={{display:'flex', alignItems:'center', justifyContent:'center', color:'var(--muted)', fontSize:'12px'}}>
+          No image yet
+        </div>
+      )}
+      {lastUpdated && (
+        <div className="snapshot-ts">
+          Updated {lastUpdated.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'})}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── History Panel ──────────────────────────────────────────────────────────
+
+function HistoryPanel({ triggeredUrl }) {
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    const load = () => {
+      fetch(`${triggeredUrl}/api/history`)
+        .then(r => r.json())
+        .then(d => setHistory(Array.isArray(d) ? d.slice(0, 20) : []))
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, [triggeredUrl]);
+
+  if (history.length === 0) return null;
+
+  return (
+    <div className="card history-card">
+      <div className="card-title">Alert History</div>
+      <div className="history-list">
+        {history.map((entry, i) => {
+          const badgeClass = !entry.cleared_by ? 'hbadge-active'
+            : entry.cleared_by === 'manual'    ? 'hbadge-manual'
+            : 'hbadge-auto';
+          const badgeText = !entry.cleared_by ? 'active'
+            : entry.duration != null ? `${entry.duration}s ${entry.cleared_by}`
+            : entry.cleared_by;
+          return (
+            <div key={i} className="history-row">
+              <span className="history-cam">{entry.camera || '—'}</span>
+              <span className="history-time">{fmtTime(entry.ts)}</span>
+              <span className={`history-badge ${badgeClass}`}>{badgeText}</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -563,22 +720,15 @@ function LogViewer({ lines, connState, autoScroll, setAutoScroll, onClear }) {
             className={`toggle-btn ${autoScroll ? 'active' : ''}`}
             onClick={() => setAutoScroll(v => !v)}
             title="Toggle auto-scroll"
-          >
-            ↓ auto-scroll
-          </button>
-          <button className="clear-btn" onClick={onClear} title="Clear display">
-            clear
-          </button>
+          >↓ auto-scroll</button>
+          <button className="clear-btn" onClick={onClear} title="Clear display">clear</button>
         </div>
       </div>
       <div className="log-body" ref={bodyRef} onScroll={handleScroll}>
         {lines.length === 0
           ? <div className="log-empty">No log entries yet.</div>
           : lines.map(l => (
-              <div
-                key={l.id}
-                className={`log-line ${l.historic ? 'historic' : ''} ${l.level}`}
-              >{l.text}</div>
+              <div key={l.id} className={`log-line ${l.historic ? 'historic' : ''} ${l.level}`}>{l.text}</div>
             ))
         }
       </div>
@@ -588,7 +738,7 @@ function LogViewer({ lines, connState, autoScroll, setAutoScroll, onClear }) {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 
-function Sidebar({ statusConn, logConn }) {
+function Sidebar({ statusConn, logConn, alertColor, cameraName }) {
   return (
     <div className="sidebar">
       <div className="card">
@@ -602,6 +752,8 @@ function Sidebar({ statusConn, logConn }) {
           <ConnectionBadge state={logConn} />
         </div>
       </div>
+
+      <SnapshotViewer alertColor={alertColor} cameraName={cameraName} />
 
       <div className="card">
         <div className="card-title">Start Commands</div>
@@ -631,6 +783,7 @@ function Sidebar({ statusConn, logConn }) {
 
 function App() {
   const [alertColor,     setAlertColor]     = useState('unknown');
+  const [alertQuiet,     setAlertQuiet]     = useState(false);
   const [cameraName,     setCameraName]     = useState('');
   const [countdown,      setCountdown]      = useState(0);
   const [statusConn,     setStatusConn]     = useState('connecting');
@@ -644,7 +797,6 @@ function App() {
   const audioRef     = useRef(null);
   const prevColorRef = useRef('unknown');
 
-  // ── Check if alert sound is available on triggered.pl ────────────────────
   useEffect(() => {
     fetch(`${CFG.triggeredUrl}/alert-sound`, { method: 'HEAD' })
       .then(r => {
@@ -656,18 +808,17 @@ function App() {
       .catch(() => {});
   }, []);
 
-  // ── Status SSE (direct to triggered.pl) ──────────────────────────────────
+  // Status SSE
   useEffect(() => {
     const es = new EventSource(`${CFG.triggeredUrl}/events`);
-
     es.onopen = () => setStatusConn('connected');
 
     es.onmessage = (e) => {
       const data = JSON.parse(e.data);
       setCameraName(data.camera || '');
       setAlertColor(data.color);
+      setAlertQuiet(!!data.quiet);
 
-      // Play sound on green → red transition
       if (data.color === 'red' && prevColorRef.current !== 'red') {
         if (audioRef.current && !soundMuted) {
           audioRef.current.currentTime = 0;
@@ -676,23 +827,15 @@ function App() {
       }
       prevColorRef.current = data.color;
 
-      if (countdownRef.current) {
-        clearInterval(countdownRef.current);
-        countdownRef.current = null;
-      }
+      if (countdownRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; }
 
       if (data.color === 'red' && data.reset_in > 0) {
         let rem = data.reset_in;
         setCountdown(rem);
         countdownRef.current = setInterval(() => {
           rem--;
-          if (rem <= 0) {
-            clearInterval(countdownRef.current);
-            countdownRef.current = null;
-            setCountdown(0);
-          } else {
-            setCountdown(rem);
-          }
+          if (rem <= 0) { clearInterval(countdownRef.current); countdownRef.current = null; setCountdown(0); }
+          else setCountdown(rem);
         }, 1000);
       } else {
         setCountdown(0);
@@ -700,32 +843,19 @@ function App() {
     };
 
     es.onerror = () => setStatusConn('disconnected');
-
-    return () => {
-      es.close();
-      if (countdownRef.current) clearInterval(countdownRef.current);
-    };
+    return () => { es.close(); if (countdownRef.current) clearInterval(countdownRef.current); };
   }, [soundMuted]);
 
-  // ── Log SSE (via dashboard.pl) ────────────────────────────────────────────
+  // Log SSE
   useEffect(() => {
     const es = new EventSource('/api/log-stream');
-
     es.onopen = () => setLogConn('connected');
 
     es.onmessage = (e) => {
       const data = JSON.parse(e.data);
       if (data.type === 'line') {
-        const entry = {
-          id:       lineIdRef.current++,
-          text:     data.text,
-          historic: data.historic,
-          level:    lineLevel(data.text),
-        };
-        setLogLines(prev => {
-          const next = [...prev, entry];
-          return next.length > 500 ? next.slice(-500) : next;
-        });
+        const entry = { id: lineIdRef.current++, text: data.text, historic: data.historic, level: lineLevel(data.text) };
+        setLogLines(prev => { const next = [...prev, entry]; return next.length > 500 ? next.slice(-500) : next; });
       } else if (data.type === 'system' || data.type === 'error') {
         setLogLines(prev => {
           const entry = { id: lineIdRef.current++, text: `[dashboard] ${data.text}`, historic: false, level: 'lvl-system' };
@@ -743,15 +873,13 @@ function App() {
   return (
     <div className="layout">
       <header className="card header">
-        <div className="header-title">
-          Visual Alert
-          <span>Dashboard</span>
-        </div>
+        <div className="header-title">Visual Alert <span>Dashboard</span></div>
         <Clock />
       </header>
 
       <StatusPanel
         color={alertColor}
+        quiet={alertQuiet}
         camera={cameraName}
         countdown={countdown}
         connState={statusConn}
@@ -760,7 +888,12 @@ function App() {
         onSoundToggle={() => setSoundMuted(m => !m)}
       />
 
-      <Sidebar statusConn={statusConn} logConn={logConn} />
+      <Sidebar
+        statusConn={statusConn}
+        logConn={logConn}
+        alertColor={alertColor}
+        cameraName={cameraName}
+      />
 
       <LogViewer
         lines={logLines}
@@ -769,6 +902,8 @@ function App() {
         setAutoScroll={setAutoScroll}
         onClear={clearLog}
       />
+
+      <HistoryPanel triggeredUrl={CFG.triggeredUrl} />
     </div>
   );
 }

@@ -1,23 +1,39 @@
 #!/usr/bin/env perl
-# triggered.pl — visual alert server (improved)
+# triggered.pl — visual alert server
 # Requires: Mojolicious (cpanm --installdeps .)
 # Perl >= 5.20 recommended
 #
 # Configuration (environment variables):
-#   PORT           — listen port            (default: 3000)
-#   LISTEN_HOST    — bind address           (default: 127.0.0.1)
-#   RESET_DELAY    — auto-reset seconds     (default: 60)
-#   WEBHOOK_TOKEN  — bearer token for auth  (default: unset = unauthenticated)
-#   LOG_FILE       — path to log file       (default: ./triggered.log)
-#   ALERT_SOUND    — path to audio file to play on alert (default: unset = silent)
-#                    supports .mp3 .wav .ogg .m4a — served to browser at /alert-sound
+#   PORT              — listen port                        (default: 3000)
+#   LISTEN_HOST       — bind address                      (default: 127.0.0.1)
+#   RESET_DELAY       — auto-reset seconds                (default: 60)
+#   WEBHOOK_TOKEN     — bearer token for auth             (default: unset = unauthenticated)
+#   LOG_FILE          — path to log file                  (default: ./triggered.log)
+#   ALERT_SOUND       — path to audio file (.mp3 .wav .ogg .m4a)
+#
+#   NOTIFY_URL        — outbound push URL (ntfy.sh / Slack / Discord / generic)
+#   NOTIFY_ON_RESET   — set to 1 to also push on alert clear (default: 0)
+#
+#   CAMERA_ALLOW      — comma-separated allow-list (only these cameras alert)
+#   CAMERA_IGNORE     — comma-separated ignore-list (these cameras are logged only)
+#
+#   QUIET_START       — quiet hours start HH:MM 24h local (e.g. 22:00)
+#   QUIET_END         — quiet hours end   HH:MM 24h local (e.g. 07:00)
+#                       During quiet hours alerts are amber (push still fires)
+#
+#   SNAPSHOT_TTL      — seconds before snapshots expire   (default: 300)
+#   SNAPSHOT_MAX_BYTES— max upload size per snapshot      (default: 2097152 = 2 MB)
 #
 # Endpoints:
-#   GET  /             — alert page (SSE-driven, PWA-installable)
-#   GET  /events       — Server-Sent Events stream
-#   POST /webhook      — trigger alert; optional JSON body: {"camera":"name"}
-#   POST /reset        — manually clear alert (set green)
-#   GET  /alert-sound  — serves the ALERT_SOUND file (only if env var is set)
+#   GET  /               — alert page (SSE-driven, PWA-installable)
+#   GET  /events         — Server-Sent Events stream
+#   POST /webhook        — trigger alert; optional JSON body: {"camera":"name"}
+#   POST /reset          — manually clear alert
+#   GET  /api/history    — JSON array of last 100 alerts (newest first)
+#   POST /snapshot       — receive camera snapshot image  (?camera=Name)
+#   GET  /snapshot/:cam  — serve latest snapshot for a camera
+#   GET  /api/snapshots  — JSON list of cameras with available snapshots
+#   GET  /alert-sound    — serves the ALERT_SOUND file (if configured)
 #   GET  /manifest.json, /icon.svg, /sw.js — PWA assets
 #
 # Deploy behind a TLS-terminating reverse proxy (nginx, caddy) for HTTPS.
@@ -27,6 +43,8 @@ use Mojolicious::Lite;
 use Mojo::IOLoop;
 use Mojo::JSON qw(encode_json);
 use Mojo::Asset::File;
+use Mojo::UserAgent;
+use POSIX qw(strftime);
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,7 +55,24 @@ my $host        = $ENV{LISTEN_HOST}  // '127.0.0.1';
 my $reset_delay = $ENV{RESET_DELAY}  // 60;
 my $token       = $ENV{WEBHOOK_TOKEN};
 my $log_file    = $ENV{LOG_FILE}     // './triggered.log';
-my $alert_sound = $ENV{ALERT_SOUND};  # e.g. /path/to/alert.mp3
+my $alert_sound = $ENV{ALERT_SOUND};
+
+my $notify_url      = $ENV{NOTIFY_URL};
+my $notify_on_reset = $ENV{NOTIFY_ON_RESET} // 0;
+
+my $camera_allow_raw  = $ENV{CAMERA_ALLOW}  // '';
+my $camera_ignore_raw = $ENV{CAMERA_IGNORE} // '';
+
+my $quiet_start = $ENV{QUIET_START};   # e.g. "22:00"
+my $quiet_end   = $ENV{QUIET_END};     # e.g. "07:00"
+
+my $snapshot_ttl  = $ENV{SNAPSHOT_TTL}        // 300;
+my $snapshot_max  = $ENV{SNAPSHOT_MAX_BYTES}  // 2_097_152;  # 2 MB
+my $snapshot_cap  = 20;  # max number of distinct cameras to store
+
+# Build camera filter lookup tables (lower-cased for case-insensitive match)
+my %cam_allow  = map { lc($_) => 1 } grep { length } split /\s*,\s*/, $camera_allow_raw;
+my %cam_ignore = map { lc($_) => 1 } grep { length } split /\s*,\s*/, $camera_ignore_raw;
 
 if ($alert_sound && !-e $alert_sound) {
     warn "[triggered] WARNING: ALERT_SOUND file not found: $alert_sound\n";
@@ -46,22 +81,21 @@ if ($alert_sound && !-e $alert_sound) {
 
 unless ($token) {
     warn "[triggered] WARNING: WEBHOOK_TOKEN is not set — "
-       . "/webhook and /reset are unauthenticated\n";
+       . "/webhook, /reset and /snapshot are unauthenticated\n";
 }
 
+warn "[triggered] CAMERA_ALLOW filter: $camera_allow_raw\n"  if %cam_allow;
+warn "[triggered] CAMERA_IGNORE filter: $camera_ignore_raw\n" if %cam_ignore;
+warn "[triggered] Quiet hours: ${quiet_start}–${quiet_end}\n" if $quiet_start && $quiet_end;
+warn "[triggered] Push notifications: $notify_url\n"          if $notify_url;
+
 # hypnotoad listen (production mode)
-# workers => 1 is required: triggered.pl uses in-process shared state
-# ($color, $clients, $timer_id) which is not shared across forked workers.
-# A multi-worker deployment would need an external broker (e.g. Redis pub/sub).
 app->config(hypnotoad => {
     listen   => ["http://$host:$port"],
     workers  => 1,
     pid_file => $ENV{HYPNOTOAD_PID} // '/tmp/triggered-hypnotoad.pid',
 });
 
-# daemon listen (development mode) — app->config(hypnotoad) is ignored by
-# the daemon server, so we hook before_server_start to apply the same
-# LISTEN_HOST / PORT env vars regardless of which server mode is used.
 app->hook(before_server_start => sub {
     my ($server, $app) = @_;
     $server->listen(["http://$host:$port"])
@@ -78,16 +112,17 @@ app->log->level('info');
 my $color       = 'green';
 my $clients     = {};
 my $timer_id;
-my $alert_time;    # epoch when alert was last triggered
-my $camera_name = '';  # camera that triggered the current alert
+my $alert_time;
+my $camera_name = '';
+my $quiet_mode  = 0;   # 1 when current time falls within quiet hours
+
+my @history   = ();    # ring buffer of last 100 alert records
+my %snapshots = ();    # camera_name => { data, mime, ts }
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Check bearer token.  Uses string comparison — for a public-facing service,
-# replace with a constant-time comparison (e.g. Crypt::ScryptKDF or
-# String::Compare::ConstantTime) to prevent timing-based token enumeration.
 sub authorized {
     my $c = shift;
     return 1 unless $token;
@@ -101,70 +136,139 @@ sub reset_remaining {
     return $rem > 0 ? int($rem) : 0;
 }
 
+# Return 1 if the current local time falls within [QUIET_START, QUIET_END)
+sub in_quiet_hours {
+    return 0 unless $quiet_start && $quiet_end;
+    my $now = strftime('%H:%M', localtime(time()));
+    if ($quiet_start le $quiet_end) {
+        return $now ge $quiet_start && $now lt $quiet_end;
+    } else {
+        # Wraps midnight (e.g. 22:00 – 07:00)
+        return $now ge $quiet_start || $now lt $quiet_end;
+    }
+}
+
+# Return 1 if a camera name is permitted to trigger an alert
+sub camera_allowed {
+    my $cam = lc(shift // '');
+    return 0 if %cam_ignore && $cam_ignore{$cam};
+    return 1 unless %cam_allow;
+    return $cam_allow{$cam} ? 1 : 0;
+}
+
+# Sanitise a camera name for use as a URL segment / hash key
+sub sanitise_camera {
+    my $cam = shift // '';
+    $cam =~ s/[^A-Za-z0-9_\-\s]//g;
+    $cam =~ s/\s+/ /g;
+    $cam = substr($cam, 0, 64);
+    $cam =~ s/^\s+|\s+$//g;
+    return $cam;
+}
+
 # Extract camera name from the request body — tolerates three real-world formats:
-#
-#   1. Valid JSON          (curl / most HTTP clients)
-#        Content-Type: application/json
-#        Body: {"camera":"Front Door"}
-#
-#   2. Plain text key:val  (Blue Iris default)
-#        Content-Type: text/plain
-#        Body: camera:Livingroom motionEye
-#
-#   3. URL query parameter  (any client, GET-style param on POST)
-#        POST /webhook?camera=Front+Door
-#
+#   1. Valid JSON:          {"camera":"Front Door"}
+#   2. Plain text key:val:  camera:Livingroom (Blue Iris default)
+#   3. URL query parameter: POST /webhook?camera=Front+Door
 sub extract_camera {
     my $c = shift;
 
-    # 1. JSON body (strict parse)
     my $json = eval { $c->req->json };
     if ($json && ref $json eq 'HASH' && length($json->{camera} // '')) {
         return $json->{camera};
     }
 
-    # 2. Raw body — covers text/plain and any other non-JSON content type
     my $raw = $c->req->body // '';
-    $raw =~ s/\A\s+|\s+\z//g;          # trim whitespace
-    $raw =~ s/\A['"](.+)['"]\z/$1/s;   # strip wrapping quotes if present
-
-    # "camera:value" plain-text (Blue Iris)
+    $raw =~ s/\A\s+|\s+\z//g;
+    $raw =~ s/\A['"](.+)['"]\z/$1/s;
     return $1 if $raw =~ /\Acamera\s*:\s*(.+)\z/i;
 
-    # 3. URL query / form parameter
     return $c->req->param('camera') // '';
 }
 
+# Broadcast current state to all SSE clients
 sub notify_clients {
     my $payload = encode_json({
         color    => $color,
         reset_in => reset_remaining(),
         camera   => $camera_name,
+        quiet    => $quiet_mode ? \1 : \0,
     });
     for my $id (keys %$clients) {
         $clients->{$id}->write("data: $payload\n\n");
     }
 }
 
+# Arm (or re-arm) the auto-reset countdown timer
 sub arm_timer {
+    my %opts = @_;
     Mojo::IOLoop->remove($timer_id) if $timer_id;
     $timer_id = Mojo::IOLoop->timer($reset_delay => sub {
+        # Record duration on the current open history entry
+        if (@history && !defined $history[-1]{cleared_at}) {
+            $history[-1]{cleared_at} = time();
+            $history[-1]{cleared_by} = 'auto';
+            $history[-1]{duration}   = time() - $history[-1]{ts};
+        }
         $color       = 'green';
         $alert_time  = undef;
         $timer_id    = undef;
         $camera_name = '';
         notify_clients();
+        app->log->info('Alert auto-reset');
+        send_notification('Alert cleared (auto-reset)', '') if $notify_on_reset && $notify_url;
     });
 }
 
+# Fire-and-forget outbound push notification (non-blocking)
+sub send_notification {
+    my ($msg, $cam) = @_;
+    return unless $notify_url;
+
+    my $ua = Mojo::UserAgent->new;
+    $ua->connect_timeout(5)->request_timeout(10);
+
+    my $tx;
+    if ($notify_url =~ m|ntfy\.sh|i) {
+        my $title = $cam ? "Alert – $cam" : 'Visual Alert';
+        $tx = $ua->post($notify_url => {
+            'X-Title'    => $title,
+            'X-Message'  => $msg,
+            'X-Priority' => 'high',
+            'X-Tags'     => 'rotating_light',
+        } => '');
+    } elsif ($notify_url =~ m|slack|i || $notify_url =~ m|discord|i) {
+        $tx = $ua->post($notify_url => json => { text => $msg });
+    } else {
+        $tx = $ua->post($notify_url => json => {
+            alert  => $msg,
+            camera => $cam // '',
+            ts     => time(),
+        });
+    }
+
+    if ($tx && $tx->result->is_error) {
+        app->log->warn("Push notification failed: " . $tx->result->message);
+    }
+}
+
 # ---------------------------------------------------------------------------
-# SSE heartbeat — keeps connections alive through proxies and load balancers
+# Timers
 # ---------------------------------------------------------------------------
 
+# SSE heartbeat — keeps connections alive through proxies
 Mojo::IOLoop->recurring(30 => sub {
     for my $id (keys %$clients) {
         $clients->{$id}->write(": ping\n\n");
     }
+});
+
+# Quiet hours — re-evaluate every 60 s and broadcast if mode changes
+$quiet_mode = in_quiet_hours();
+Mojo::IOLoop->recurring(60 => sub {
+    my $prev = $quiet_mode;
+    $quiet_mode = in_quiet_hours();
+    notify_clients() if $prev != $quiet_mode;
 });
 
 # ---------------------------------------------------------------------------
@@ -177,14 +281,50 @@ post '/webhook' => sub {
     return $c->render(json => { error => 'Unauthorized' }, status => 401)
         unless authorized($c);
 
-    $camera_name = extract_camera($c);
+    my $cam = extract_camera($c);
+
+    # Camera filtering
+    unless (camera_allowed(lc($cam))) {
+        my $reason = %cam_ignore && $cam_ignore{lc($cam)} ? 'ignore-list' : 'not in allow-list';
+        app->log->info("Webhook suppressed — camera '$cam' on $reason");
+        return $c->render(json => { status => 'suppressed', camera => $cam });
+    }
+
+    $camera_name = $cam;
     $color       = 'red';
     $alert_time  = time();
     arm_timer();
     notify_clients();
+
+    # History: push new entry (cap at 100)
+    push @history, {
+        camera     => $camera_name,
+        ts         => $alert_time,
+        cleared_at => undef,
+        cleared_by => undef,
+        duration   => undef,
+    };
+    shift @history if @history > 100;
+
     my $cam_info = $camera_name ? " (camera: $camera_name)" : '';
-    app->log->info("Alert triggered via webhook$cam_info");
-    $c->render(json => { status => 'ok', color => $color, reset_in => $reset_delay, camera => $camera_name });
+    my $q_info   = $quiet_mode  ? ' [quiet hours]'           : '';
+    app->log->info("Alert triggered via webhook${cam_info}${q_info}");
+
+    # Push notification (non-blocking via next-tick timer)
+    if ($notify_url) {
+        my $notif_cam = $camera_name;
+        my $notif_msg = $camera_name ? "Alert – $camera_name" : 'Alert triggered';
+        $notif_msg   .= ' (quiet hours)' if $quiet_mode;
+        Mojo::IOLoop->timer(0 => sub { send_notification($notif_msg, $notif_cam) });
+    }
+
+    $c->render(json => {
+        status   => 'ok',
+        color    => $color,
+        reset_in => $reset_delay,
+        camera   => $camera_name,
+        quiet    => $quiet_mode ? \1 : \0,
+    });
 };
 
 # Manual reset
@@ -194,17 +334,31 @@ post '/reset' => sub {
         unless authorized($c);
 
     Mojo::IOLoop->remove($timer_id) if $timer_id;
-    $timer_id    = undef;
-    $color       = 'green';
-    $alert_time  = undef;
-    # $camera_name = '';
+    $timer_id   = undef;
+
+    # Record duration on the current open history entry
+    if (@history && !defined $history[-1]{cleared_at}) {
+        $history[-1]{cleared_at} = time();
+        $history[-1]{cleared_by} = 'manual';
+        $history[-1]{duration}   = time() - $history[-1]{ts};
+    }
+
+    $color      = 'green';
+    $alert_time = undef;
     notify_clients();
+
     my $cam_info = $camera_name ? " (camera: $camera_name)" : '';
-    app->log->info("Alert manually reset$cam_info");
+    app->log->info("Alert manually reset${cam_info}");
+
+    if ($notify_url && $notify_on_reset) {
+        my $notif_cam = $camera_name;
+        Mojo::IOLoop->timer(0 => sub { send_notification('Alert cleared (manual reset)', $notif_cam) });
+    }
+
     $c->render(json => { status => 'ok', color => $color });
 };
 
-# SSE stream — sends current state immediately, then pushes updates
+# SSE stream — sends current state immediately on connect, then pushes updates
 get '/events' => sub {
     my $c = shift;
     $c->inactivity_timeout(300);
@@ -218,18 +372,96 @@ get '/events' => sub {
     $c->res->headers->cache_control('no-cache');
     $c->res->headers->header('Access-Control-Allow-Origin' => '*');
 
-    my $payload = encode_json({ color => $color, reset_in => reset_remaining(), camera => $camera_name });
+    my $payload = encode_json({
+        color    => $color,
+        reset_in => reset_remaining(),
+        camera   => $camera_name,
+        quiet    => $quiet_mode ? \1 : \0,
+    });
     $c->write("data: $payload\n\n");
 };
 
-# Status page — passes sound_url into the template
+# Alert history (newest first, last 100 events)
+get '/api/history' => sub {
+    my $c = shift;
+    $c->res->headers->header('Access-Control-Allow-Origin' => '*');
+    $c->res->headers->cache_control('no-cache');
+    $c->render(json => [reverse @history]);
+};
+
+# Receive a camera snapshot image from Blue Iris (or any HTTP client)
+post '/snapshot' => sub {
+    my $c = shift;
+    return $c->render(json => { error => 'Unauthorized' }, status => 401)
+        unless authorized($c);
+
+    my $cam  = sanitise_camera($c->req->param('camera') // '');
+    my $body = $c->req->body // '';
+    my $size = length($body);
+
+    return $c->render(json => { error => 'camera parameter required' }, status => 400)
+        unless length($cam);
+
+    return $c->render(json => { error => 'Payload too large' }, status => 413)
+        if $size > $snapshot_max;
+
+    my $mime = $c->req->headers->content_type // 'image/jpeg';
+    $mime = 'image/jpeg' unless $mime =~ m{^image/};
+
+    # Evict oldest camera entry if cap reached
+    if (!exists $snapshots{$cam} && scalar(keys %snapshots) >= $snapshot_cap) {
+        my ($oldest) = sort { $snapshots{$a}{ts} <=> $snapshots{$b}{ts} } keys %snapshots;
+        delete $snapshots{$oldest};
+        app->log->warn("Snapshot camera cap ($snapshot_cap) reached — evicted: $oldest");
+    }
+
+    $snapshots{$cam} = { data => $body, mime => $mime, ts => time() };
+    app->log->info("Snapshot stored: $cam ($size bytes)");
+
+    $c->render(json => { status => 'ok', camera => $cam, bytes => $size });
+};
+
+# Serve latest snapshot for a camera
+get '/snapshot/:camera' => sub {
+    my $c   = shift;
+    my $cam = sanitise_camera($c->param('camera'));
+    my $snap = $snapshots{$cam};
+
+    return $c->reply->not_found unless $snap;
+
+    if (time() - $snap->{ts} > $snapshot_ttl) {
+        delete $snapshots{$cam};
+        return $c->reply->not_found;
+    }
+
+    $c->res->headers->content_type($snap->{mime});
+    $c->res->headers->cache_control('no-cache, no-store');
+    $c->res->headers->header('Access-Control-Allow-Origin' => '*');
+    $c->res->headers->header('X-Snapshot-Ts'              => $snap->{ts});
+    $c->render(data => $snap->{data});
+};
+
+# List cameras that have a live (non-expired) snapshot
+get '/api/snapshots' => sub {
+    my $c = shift;
+    $c->res->headers->header('Access-Control-Allow-Origin' => '*');
+    my $now = time();
+    my @live = grep { $now - $snapshots{$_}{ts} <= $snapshot_ttl } keys %snapshots;
+    # Sort: active alert camera first, then alphabetical
+    @live = sort {
+        ($b eq $camera_name) <=> ($a eq $camera_name) || $a cmp $b
+    } @live;
+    $c->render(json => { cameras => \@live });
+};
+
+# Status page
 get '/' => sub {
     my $c = shift;
     $c->stash(sound_url => $alert_sound ? '/alert-sound' : '');
     $c->render('index');
 };
 
-# Serve audio file for in-browser alert sound
+# Serve audio file
 get '/alert-sound' => sub {
     my $c = shift;
     return $c->reply->not_found unless $alert_sound && -e $alert_sound;
@@ -262,7 +494,7 @@ get '/manifest.json' => sub {
     });
 };
 
-# PWA — app icon (green/red circle, colour matches OK state)
+# PWA — app icon
 get '/icon.svg' => sub {
     my $c = shift;
     $c->res->headers->content_type('image/svg+xml');
@@ -274,13 +506,13 @@ get '/icon.svg' => sub {
     );
 };
 
-# PWA — service worker (network-first, bypasses cache for SSE/API routes)
+# PWA — service worker
 get '/sw.js' => sub {
     my $c = shift;
     $c->res->headers->content_type('application/javascript');
     $c->render(text => <<'END_SW');
 const CACHE = 'visual-alert-v1';
-const BYPASS = ['/events', '/webhook', '/reset', '/alert-sound'];
+const BYPASS = ['/events', '/webhook', '/reset', '/snapshot', '/alert-sound', '/api/'];
 
 self.addEventListener('install',  () => self.skipWaiting());
 self.addEventListener('activate', () => clients.claim());
@@ -366,7 +598,6 @@ __DATA__
       font-variant-numeric: tabular-nums;
     }
 
-    /* ── Corner controls ─────────────────────────────── */
     #controls {
       position: fixed;
       bottom: max(1rem, env(safe-area-inset-bottom));
@@ -415,15 +646,12 @@ __DATA__
   </div>
 
   <script>
-    // ── Config injected by server ──────────────────────────
     var SOUND_URL = '<%== $sound_url %>';
 
-    // ── Audio setup ────────────────────────────────────────
     var audio       = SOUND_URL ? new Audio(SOUND_URL) : null;
     var soundMuted  = false;
     var audioUnlocked = false;
 
-    // Unlock audio context on first touch/click (browser autoplay policy)
     function unlockAudio() {
       if (!audio || audioUnlocked) return;
       audio.play().then(function () {
@@ -449,7 +677,6 @@ __DATA__
       });
     }
 
-    // ── SSE state ──────────────────────────────────────────
     var source           = new EventSource('/events');
     var countdownTimer   = null;
     var secondsRemaining = 0;
@@ -461,26 +688,27 @@ __DATA__
 
     source.onmessage = function (e) {
       var data = JSON.parse(e.data);
-      applyState(data.color, data.reset_in || 0, data.camera || '');
+      applyState(data.color, data.reset_in || 0, data.camera || '', data.quiet || false);
     };
 
     source.onerror = function () {
       document.getElementById('conn-status').textContent = 'reconnecting…';
     };
 
-    // ── State application ──────────────────────────────────
-    function applyState(color, resetIn, camera) {
-      var wasGreen = currentColor !== 'red';
-      currentColor = color;
+    function applyState(color, resetIn, camera, quiet) {
+      var wasGreen = currentColor !== 'red' && currentColor !== 'amber';
+      currentColor = (color === 'red' && quiet) ? 'amber' : color;
 
-      document.body.style.backgroundColor =
-        color === 'red' ? '#dc2626' : '#15803d';
+      var bgColor =
+        color === 'red' && quiet  ? '#b45309' :
+        color === 'red'           ? '#dc2626' : '#15803d';
 
-      document.getElementById('theme-meta').setAttribute('content',
-        color === 'red' ? '#dc2626' : '#15803d');
+      document.body.style.backgroundColor = bgColor;
+      document.getElementById('theme-meta').setAttribute('content', bgColor);
 
       document.getElementById('label').textContent =
-        color === 'red' ? 'ALERT' : 'OK';
+        color === 'red' && quiet  ? 'QUIET'  :
+        color === 'red'           ? 'ALERT'  : 'OK';
 
       document.getElementById('camera').textContent =
         (color === 'red' && camera) ? camera : '';
@@ -491,7 +719,7 @@ __DATA__
       document.getElementById('countdown').textContent = '';
 
       if (color === 'red') {
-        if (wasGreen) playAlert();   // only play on transition green→red
+        if (wasGreen) playAlert();
         if (resetIn > 0) {
           secondsRemaining = resetIn;
           renderCountdown();
@@ -514,7 +742,6 @@ __DATA__
         'Auto-reset in ' + secondsRemaining + 's';
     }
 
-    // ── PWA service worker ─────────────────────────────────
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(function () {});
     }
