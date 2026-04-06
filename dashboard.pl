@@ -603,23 +603,21 @@ function Sidebar({ statusConn, logConn }) {
       <div className="card">
         <div className="card-title">Start Commands</div>
         <div className="cmd-block">
-          <div className="cmd-comment"># development</div>
-          <div>WEBHOOK_TOKEN=secret \</div>
-          <div>&nbsp;perl triggered.pl daemon</div>
+          <div className="cmd-comment"># development (default)</div>
+          <div>trigctl start</div>
           <br/>
-          <div className="cmd-comment"># production</div>
-          <div>WEBHOOK_TOKEN=secret \</div>
-          <div>&nbsp;hypnotoad triggered.pl</div>
+          <div className="cmd-comment"># production (hypnotoad)</div>
+          <div>trigctl start --prod</div>
           <br/>
-          <div className="cmd-comment"># trigger alert</div>
-          <div>curl -X POST \</div>
-          <div>&nbsp;-H "Authorization: Bearer secret" \</div>
-          <div>&nbsp;{CFG.triggeredUrl}/webhook</div>
+          <div className="cmd-comment"># status &amp; client count</div>
+          <div>trigctl status</div>
           <br/>
-          <div className="cmd-comment"># manual reset</div>
-          <div>curl -X POST \</div>
-          <div>&nbsp;-H "Authorization: Bearer secret" \</div>
-          <div>&nbsp;{CFG.triggeredUrl}/reset</div>
+          <div className="cmd-comment"># trigger / reset</div>
+          <div>trigctl trigger "Camera"</div>
+          <div>trigctl reset</div>
+          <br/>
+          <div className="cmd-comment"># stop</div>
+          <div>trigctl stop</div>
         </div>
       </div>
     </div>
