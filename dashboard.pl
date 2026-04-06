@@ -38,7 +38,10 @@ warn "[dashboard] WARNING: WEBHOOK_TOKEN is not set\n" unless $token;
 warn "[dashboard] Tailing log: $log_file\n";
 warn "[dashboard] Alert server: $triggered_url\n";
 
-app->config(hypnotoad => { listen => ["http://$host:$port"] });
+app->config(hypnotoad => {
+    listen   => ["http://$host:$port"],
+    pid_file => $ENV{HYPNOTOAD_PID} // '/tmp/dashboard-hypnotoad.pid',
+});
 
 app->hook(before_server_start => sub {
     my ($server, $app) = @_;
