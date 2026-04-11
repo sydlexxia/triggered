@@ -2,7 +2,7 @@
 
 A lightweight, real-time visual alert system built with Perl + Mojolicious.
 An external system (CI pipeline, monitoring tool, cron job, etc.) fires a webhook — every connected browser instantly flips to a red **ALERT** screen, then auto-resets to green after a configurable countdown.
-A companion React dashboard provides a live status panel and real-time log viewer.
+A companion React dashboard provides a live status panel, real-time log viewer, alert history, and camera snapshot viewer.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -11,7 +11,9 @@ A companion React dashboard provides a live status panel and real-time log viewe
 │                                                     │
 │  POST /webhook  ──►  SSE /events  ──►  browser      │
 │  POST /reset          /api/log-stream               │
+│  POST /snapshot       /api/snapshots (proxy)        │
 │  GET  /events         GET /                         │
+│  GET  /api/history                                  │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -21,8 +23,8 @@ A companion React dashboard provides a live status panel and real-time log viewe
 
 | File | Description |
 |---|---|
-| `triggered.pl` | Alert server — webhook receiver, SSE broadcaster, auto-reset timer |
-| `dashboard.pl` | Monitoring dashboard — React UI, live log tail over SSE |
+| `triggered.pl` | Alert server — webhook receiver, SSE broadcaster, auto-reset timer, snapshot cache, alert history |
+| `dashboard.pl` | Monitoring dashboard — React UI, live log tail over SSE, snapshot proxy |
 | `trigctl` | Control script — start, stop, status, logs, and more |
 | `cpanfile` | Perl dependency declaration (`Mojolicious >= 9.0`) |
 
@@ -93,6 +95,8 @@ trigctl stop      # graceful shutdown of both servers
 | `trigctl reload` | Zero-downtime hypnotoad reload — prod mode only |
 | `trigctl trigger ["Camera Name"]` | Fire a test webhook using the configured token |
 | `trigctl reset` | Clear the alert via API |
+| `trigctl setup` | First-time dependency install |
+| `trigctl doctor` | Pre-flight checks — Perl version, deps, port availability, config |
 | `trigctl help` | Full usage reference |
 
 ### Modes
@@ -117,6 +121,7 @@ LOG_FILE=./triggered.log
 TRIGGERED_LOG=./triggered.log
 DASHBOARD_LOG=./dashboard.log
 # ALERT_SOUND=/path/to/alert.mp3
+# DEBUG=1
 ```
 
 CLI `KEY=VALUE` args always take precedence:
@@ -148,6 +153,9 @@ trigctl logs triggered
 
 # Zero-downtime reload after editing a Perl script (prod only)
 trigctl reload
+
+# Enable verbose debug logging
+DEBUG=1 trigctl start
 ```
 
 ---
@@ -164,9 +172,18 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 | `PORT` | `3000` | Listen port |
 | `LISTEN_HOST` | `127.0.0.1` | Bind address |
 | `RESET_DELAY` | `60` | Seconds before auto-reset to green |
-| `WEBHOOK_TOKEN` | *(unset)* | Bearer token required on `/webhook` and `/reset`. If unset, endpoints are open — a warning is printed at startup |
+| `WEBHOOK_TOKEN` | *(unset)* | Bearer token required on `/webhook`, `/reset`, and `/snapshot`. If unset, endpoints are open — a warning is printed at startup |
 | `LOG_FILE` | `./triggered.log` | Path to write log output |
 | `ALERT_SOUND` | *(unset)* | Path to an audio file (`.mp3`, `.wav`, `.ogg`, `.m4a`) played in the browser when an alert fires. Served to the browser at `/alert-sound`. If unset, the alert is silent |
+| `CAMERA_ALLOW` | *(unset)* | Comma-separated list of camera names. When set, only cameras in this list trigger an alert; all others are suppressed |
+| `CAMERA_IGNORE` | *(unset)* | Comma-separated list of camera names to always suppress (logged but never trigger an alert) |
+| `QUIET_START` | *(unset)* | Start of quiet hours in 24h `HH:MM` format (e.g. `22:00`). Alerts during quiet hours show an amber **QUIET** state instead of red |
+| `QUIET_END` | *(unset)* | End of quiet hours in 24h `HH:MM` format (e.g. `07:00`). Wraps midnight correctly |
+| `NOTIFY_URL` | *(unset)* | Push notification endpoint. Supports ntfy.sh, Slack, Discord, or any generic HTTP webhook |
+| `NOTIFY_ON_RESET` | `0` | Set `1` to also send a push notification when the alert clears |
+| `SNAPSHOT_TTL` | `300` | Seconds before a stored camera snapshot is considered expired |
+| `SNAPSHOT_MAX_BYTES` | `2097152` | Maximum snapshot upload size in bytes (default 2 MB) |
+| `DEBUG` | `0` | Set `1` to enable verbose debug logging. Debug lines appear in cyan in the dashboard log viewer |
 
 ### dashboard.pl
 
@@ -177,6 +194,7 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 | `TRIGGERED_URL` | `http://127.0.0.1:3000` | Base URL of triggered.pl (used by the React frontend to connect to `/events`) |
 | `TRIGGERED_LOG` | `./triggered.log` | Path to the triggered.pl log file to tail |
 | `WEBHOOK_TOKEN` | *(unset)* | Same token as triggered.pl |
+| `DEBUG` | `0` | Set `1` to enable verbose debug logging |
 
 ---
 
@@ -184,8 +202,7 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 
 ### `POST /webhook`
 Triggers an alert — sets state to **red** and starts the auto-reset countdown.
-Accepts an optional JSON body with a `camera` field; the camera name is broadcast
-to all connected clients and displayed on the alert screen.
+Accepts an optional body with a `camera` field in JSON, `camera:Name` plain-text (Blue Iris default), or `?camera=Name` URL parameter.
 
 ```bash
 # Basic trigger
@@ -200,13 +217,19 @@ curl -X POST \
   -d '{"camera":"Front Door"}' \
   http://127.0.0.1:3000/webhook
 
+# Blue Iris plain-text body format
+curl -X POST \
+  -H "Authorization: Bearer secret" \
+  -d 'camera:Front Door' \
+  http://127.0.0.1:3000/webhook
+
 # Shortcut via trigctl (uses token from .trigctl.env)
 trigctl trigger "Front Door"
 ```
 
 **Response:**
 ```json
-{ "status": "ok", "color": "red", "reset_in": 60, "camera": "Front Door" }
+{ "status": "ok", "color": "red", "reset_in": 60, "camera": "Front Door", "quiet": false }
 ```
 
 ---
@@ -239,19 +262,86 @@ curl -N http://127.0.0.1:3000/events
 
 **Event format:**
 ```
-data: {"color":"red","reset_in":42,"camera":"Front Door"}
+data: {"color":"red","reset_in":42,"camera":"Front Door","quiet":false}
+```
+
+`color` is `"green"`, `"red"`, or `"amber"` (red during quiet hours). A 30-second heartbeat comment (`: ping`) keeps proxy connections alive.
+
+---
+
+### `POST /snapshot`
+Stores a camera snapshot image in memory (max `SNAPSHOT_MAX_BYTES`, up to 20 cameras). Requires auth.
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer secret" \
+  -H "Content-Type: image/jpeg" \
+  --data-binary @frame.jpg \
+  "http://127.0.0.1:3000/snapshot?camera=Front+Door"
+```
+
+**Response:**
+```json
+{ "status": "ok", "camera": "Front Door", "bytes": 48210 }
 ```
 
 ---
 
-### `GET /`
+### `GET /snapshot/:camera`
+Serves the most recent stored snapshot for a camera. Returns `404` if no snapshot exists or if it has expired (`SNAPSHOT_TTL`).
+
+```bash
+curl http://127.0.0.1:3000/snapshot/Front%20Door > frame.jpg
+```
+
+---
+
+### `GET /api/snapshots`
+Lists cameras that currently have a live (non-expired) snapshot. The active alert camera is sorted first.
+
+```bash
+curl http://127.0.0.1:3000/api/snapshots
+```
+
+**Response:**
+```json
+{ "cameras": ["Front Door", "Garage", "Backyard"] }
+```
+
+---
+
+### `GET /api/history`
+Returns the last 100 alert records, newest first.
+
+```bash
+curl http://127.0.0.1:3000/api/history
+```
+
+**Response:**
+```json
+[
+  { "camera": "Front Door", "ts": 1712700000, "cleared_at": 1712700060,
+    "cleared_by": "auto", "duration": 60 },
+  ...
+]
+```
+
+`cleared_by` is `"auto"` (countdown), `"manual"` (reset API), `"replaced"` (new alert before reset), or `null` (still active).
+
+---
+
+### `GET /` *(triggered.pl)*
 The alert page — a full-screen colour display that reacts to the SSE stream.
-Green = **OK**, Red = **ALERT** with a live countdown.
+Green = **OK**, Red = **ALERT** with a live countdown, Amber = **QUIET** (alert during quiet hours).
 
 ---
 
 ### `GET /api/log-stream` *(dashboard.pl)*
-SSE stream that sends the last 100 lines of the log file on connect, then tails new entries in real time.
+SSE stream that sends the last 100 lines of the log file on connect, then tails new entries in real time. Each event is a JSON object:
+
+```
+data: {"type":"line","text":"[2026-04-10 10:00:00] [info] Alert triggered","historic":false}
+```
 
 ```bash
 curl -N http://127.0.0.1:3001/api/log-stream
@@ -266,6 +356,44 @@ Health check.
 curl http://127.0.0.1:3001/api/ping
 # {"status":"ok","ts":1234567890}
 ```
+
+---
+
+## Debug Logging
+
+Both scripts support a `DEBUG=1` mode that emits verbose diagnostic output using Mojolicious's native `debug` log level, writing to the same log file as normal output.
+
+```bash
+# Enable via CLI
+DEBUG=1 trigctl start
+
+# Enable permanently in .trigctl.env
+echo 'DEBUG=1' >> .trigctl.env
+```
+
+When `DEBUG=1`:
+
+**triggered.pl** logs:
+- Full config/env dump at startup (token value redacted)
+- Raw webhook body and extracted camera name
+- Camera filtering decisions (allowed / suppressed + reason)
+- State transitions (previous → new color)
+- `arm_timer` arm/replace/fire events with timer IDs
+- `notify_clients` call with client count and broadcast payload
+- SSE client connect and disconnect with counts
+- Push notification URL, outcome, and HTTP status
+- Quiet hours check result on every 60-second tick
+- Snapshot store, eviction, and total count
+
+**dashboard.pl** logs:
+- Full config/env dump at startup
+- Log tail operations — file open, total lines, seek position
+- New lines found on each 0.5-second poll tick
+- Log file not-found polling and file-appearance events
+- Snapshot proxy requests — upstream URL, HTTP status, bytes, content-type
+- SSE log-stream client connect and disconnect
+
+Debug lines appear in **cyan** in the dashboard's log viewer.
 
 ---
 
@@ -304,6 +432,7 @@ curl http://127.0.0.1:3001/api/ping
 - No desktop notifications — purely visual (and optionally audio), making it ideal as an unobtrusive background monitor or a dedicated wall-mounted display
 - The screen auto-resets to **green** after `RESET_DELAY` seconds (default 60), or immediately when Blue Iris sends a reset via `POST /reset` on the **alert ends** action
 - Multiple cameras can all point to the same webhook endpoint — any one of them triggers the alert, and the camera name identifies which one fired
+- Use `CAMERA_IGNORE` to suppress noisy cameras, or `CAMERA_ALLOW` to restrict alerts to specific cameras only
 - The dashboard at `:3001` logs each camera-triggered event with a timestamp in the live log viewer
 
 **Optional — auto-reset when motion ends:**
@@ -317,6 +446,18 @@ Add a second Web request action under **On alert end…**:
 | **Add HTTP Headers** | `Authorization: Bearer webhook_token` |
 
 This clears the screen the moment Blue Iris considers the motion event over, rather than waiting for the countdown.
+
+**Optional — push snapshots from Blue Iris:**
+
+In Blue Iris's **On alert** action, add a second Web request to push the camera frame:
+
+| Field | Value |
+|---|---|
+| **URL** | `http://<alert-server-ip>:3000/snapshot?camera=&CAM` |
+| **Post/Payload** | *(image binary via Blue Iris HTTP post feature)* |
+| **Add HTTP Headers** | `Authorization: Bearer webhook_token` |
+
+Snapshots appear in the dashboard's camera viewer panel and are available for `SNAPSHOT_TTL` seconds.
 
 ---
 
@@ -359,6 +500,26 @@ repeated webhooks while already in alert state).
 > The first click or tap on the alert page unlocks audio for that session.
 > For unattended displays, open the page and tap once to prime it.
 
+### Enable quiet hours
+
+During quiet hours, incoming webhooks still record history but the alert state is set to **amber** rather than red, and the browser displays **QUIET** instead of **ALERT**. Add to `.trigctl.env`:
+
+```
+QUIET_START=22:00
+QUIET_END=07:00
+```
+
+Time is in local 24h format. Midnight-wrapping ranges (e.g. `22:00`–`07:00`) are handled correctly.
+
+### Enable push notifications
+
+```
+NOTIFY_URL=https://ntfy.sh/your-topic
+NOTIFY_ON_RESET=1
+```
+
+Supported services: ntfy.sh, Slack incoming webhooks, Discord webhooks, or any generic HTTP endpoint that accepts a JSON POST. Notifications are sent asynchronously and never delay the webhook response.
+
 ---
 
 ### Production mode
@@ -394,12 +555,14 @@ hypnotoad dashboard.pl --stop
 
 The React dashboard (served by `dashboard.pl`) gives you:
 
-- **Status panel** — live colour indicator, ALERT/OK label, countdown timer
-- **Connection badges** — shows whether each SSE stream is connected, connecting, or disconnected
-- **Log viewer** — last 500 lines of the triggered.pl log, colour-coded by level, with auto-scroll and clear controls
+- **Status panel** — live colour indicator (green/red/amber), ALERT/OK/QUIET label, countdown timer, camera name, and sound toggle
+- **Connection badges** — shows whether the alert server SSE stream and log stream are connected, connecting, or disconnected
+- **Snapshot viewer** — tabbed live camera snapshots polled every 2 seconds; auto-switches to the triggering camera when an alert fires
+- **Alert history** — last 20 alert records with camera name, timestamp, duration, and how the alert was cleared (auto / manual / replaced / active)
+- **Log viewer** — last 500 lines of the triggered.pl log, colour-coded by level (info white, warn amber, error red, **debug cyan**), with auto-scroll and clear controls
 - **Command reference** — copy-paste start/trigger/reset commands in the sidebar
 
-The dashboard connects directly to `triggered.pl`'s `/events` endpoint for status updates (CORS is enabled on that route) and to its own `/api/log-stream` for the log tail.
+The dashboard connects directly to `triggered.pl`'s `/events` endpoint for status updates (CORS is enabled on that route) and to its own `/api/log-stream` for the log tail. Snapshot images are proxied through `dashboard.pl` to avoid cross-origin image load issues.
 
 ---
 
@@ -420,7 +583,7 @@ For the best wall-mount or bedside display experience, pair with your device's *
 
 ## Security Notes
 
-- `WEBHOOK_TOKEN` uses HTTP Bearer authentication. If unset, `/webhook` and `/reset` are open to anyone who can reach the port — always set a token in any networked environment.
+- `WEBHOOK_TOKEN` uses HTTP Bearer authentication. If unset, `/webhook`, `/reset`, and `/snapshot` are open to anyone who can reach the port — always set a token in any networked environment.
 - Both scripts bind to `127.0.0.1` by default. Set `LISTEN_HOST=0.0.0.0` only if you need LAN/WAN access.
 - For public-facing deployments, place both servers behind a TLS-terminating reverse proxy (nginx, Caddy) and set `LISTEN_HOST=127.0.0.1`.
 - `.trigctl.env` contains your token — it is gitignored by default. Never commit it.
@@ -437,3 +600,4 @@ For the best wall-mount or bedside display experience, pair with your device's *
 | `triggered.pl` | Full rewrite — auth, env config, JSON API, CORS, logging |
 | `dashboard.pl` | React monitoring dashboard with live log tail |
 | `trigctl` | Control script — unified start/stop/status/reload for both servers |
+| *(current)* | Camera snapshots, alert history, quiet hours, push notifications, camera filtering, `DEBUG=1` logging |

@@ -105,6 +105,22 @@ app->hook(before_server_start => sub {
 app->log->path($log_file);
 app->log->level('info');
 
+my $DEBUG = $ENV{DEBUG} // 0;
+app->log->level($DEBUG ? 'debug' : 'info');
+sub dlog { app->log->debug(shift) if $DEBUG }
+
+if ($DEBUG) {
+    dlog("=== triggered.pl startup ===");
+    dlog("PORT=$port  LISTEN_HOST=$host  RESET_DELAY=$reset_delay");
+    dlog("LOG_FILE=$log_file");
+    dlog("WEBHOOK_TOKEN=" . ($token ? "[REDACTED len=" . length($token) . "]" : "[unset]"));
+    dlog("NOTIFY_URL=" . ($notify_url // '[unset]') . "  NOTIFY_ON_RESET=$notify_on_reset");
+    dlog("CAMERA_ALLOW=" . ($camera_allow_raw || '[unset]') . "  CAMERA_IGNORE=" . ($camera_ignore_raw || '[unset]'));
+    dlog("QUIET_START=" . ($quiet_start // '[unset]') . "  QUIET_END=" . ($quiet_end // '[unset]'));
+    dlog("SNAPSHOT_TTL=$snapshot_ttl  SNAPSHOT_MAX_BYTES=$snapshot_max  SNAPSHOT_CAP=$snapshot_cap");
+    dlog("ALERT_SOUND=" . ($alert_sound // '[unset]'));
+}
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
@@ -140,12 +156,15 @@ sub reset_remaining {
 sub in_quiet_hours {
     return 0 unless $quiet_start && $quiet_end;
     my $now = strftime('%H:%M', localtime(time()));
+    my $result;
     if ($quiet_start le $quiet_end) {
-        return $now ge $quiet_start && $now lt $quiet_end;
+        $result = ($now ge $quiet_start && $now lt $quiet_end) ? 1 : 0;
     } else {
         # Wraps midnight (e.g. 22:00 – 07:00)
-        return $now ge $quiet_start || $now lt $quiet_end;
+        $result = ($now ge $quiet_start || $now lt $quiet_end) ? 1 : 0;
     }
+    dlog("in_quiet_hours: now=$now start=$quiet_start end=$quiet_end => $result");
+    return $result;
 }
 
 # Return 1 if a camera name is permitted to trigger an alert
@@ -194,6 +213,7 @@ sub notify_clients {
         camera   => $camera_name,
         quiet    => $quiet_mode ? \1 : \0,
     });
+    dlog("notify_clients: count=" . scalar(keys %$clients) . " payload=$payload");
     for my $id (keys %$clients) {
         $clients->{$id}->write("data: $payload\n\n");
     }
@@ -202,8 +222,10 @@ sub notify_clients {
 # Arm (or re-arm) the auto-reset countdown timer
 sub arm_timer {
     my %opts = @_;
+    dlog("arm_timer: arming delay=${reset_delay}s" . ($timer_id ? " replacing=$timer_id" : ""));
     Mojo::IOLoop->remove($timer_id) if $timer_id;
     $timer_id = Mojo::IOLoop->timer($reset_delay => sub {
+        dlog("arm_timer: fired — auto-resetting");
         # Record duration on the current open history entry
         if (@history && !defined $history[-1]{cleared_at}) {
             $history[-1]{cleared_at} = time();
@@ -218,12 +240,14 @@ sub arm_timer {
         app->log->info('Alert auto-reset');
         send_notification('Alert cleared (auto-reset)', '') if $notify_on_reset && $notify_url;
     });
+    dlog("arm_timer: new timer_id=$timer_id");
 }
 
 # Fire-and-forget outbound push notification (non-blocking)
 sub send_notification {
     my ($msg, $cam) = @_;
     return unless $notify_url;
+    dlog("send_notification: url=$notify_url msg=$msg cam=" . ($cam // ''));
 
     my $ua = Mojo::UserAgent->new;
     $ua->connect_timeout(5)->request_timeout(10);
@@ -249,6 +273,9 @@ sub send_notification {
 
     if ($tx && $tx->result->is_error) {
         app->log->warn("Push notification failed: " . $tx->result->message);
+        dlog("send_notification: FAILED status=" . $tx->result->code . " body=" . $tx->result->body);
+    } else {
+        dlog("send_notification: OK status=" . ($tx ? $tx->result->code : 'n/a'));
     }
 }
 
@@ -268,7 +295,10 @@ $quiet_mode = in_quiet_hours();
 Mojo::IOLoop->recurring(60 => sub {
     my $prev = $quiet_mode;
     $quiet_mode = in_quiet_hours();
-    notify_clients() if $prev != $quiet_mode;
+    if ($prev != $quiet_mode) {
+        dlog("quiet_hours_check: mode changed prev=$prev new=$quiet_mode — broadcasting");
+        notify_clients();
+    }
 });
 
 # ---------------------------------------------------------------------------
@@ -282,19 +312,30 @@ post '/webhook' => sub {
         unless authorized($c);
 
     my $cam = extract_camera($c);
+    dlog("/webhook: body=" . substr($c->req->body // '', 0, 256));
+    dlog("/webhook: camera='$cam'");
 
     # Camera filtering
     unless (camera_allowed(lc($cam))) {
         my $reason = %cam_ignore && $cam_ignore{lc($cam)} ? 'ignore-list' : 'not in allow-list';
+        dlog("/webhook: suppressed camera='$cam' reason=$reason");
         app->log->info("Webhook suppressed — camera '$cam' on $reason");
         return $c->render(json => { status => 'suppressed', camera => $cam });
     }
 
+    dlog("/webhook: ALERT prev_color=$color quiet=$quiet_mode");
     $camera_name = $cam;
     $color       = 'red';
     $alert_time  = time();
     arm_timer();
     notify_clients();
+
+    # History: close any previously unclosed entry (rapid re-trigger before auto-reset)
+    if (@history && !defined $history[-1]{cleared_at}) {
+        $history[-1]{cleared_at} = time();
+        $history[-1]{cleared_by} = 'replaced';
+        $history[-1]{duration}   = time() - $history[-1]{ts};
+    }
 
     # History: push new entry (cap at 100)
     push @history, {
@@ -333,6 +374,7 @@ post '/reset' => sub {
     return $c->render(json => { error => 'Unauthorized' }, status => 401)
         unless authorized($c);
 
+    dlog("/reset: manual reset camera_was='$camera_name' color_was=$color");
     Mojo::IOLoop->remove($timer_id) if $timer_id;
     $timer_id   = undef;
 
@@ -345,6 +387,7 @@ post '/reset' => sub {
 
     $color      = 'green';
     $alert_time = undef;
+    dlog("/reset: cleared, broadcasting to " . scalar(keys %$clients) . " clients");
     notify_clients();
 
     my $cam_info = $camera_name ? " (camera: $camera_name)" : '';
@@ -366,7 +409,11 @@ get '/events' => sub {
     my $stream = Mojo::IOLoop->stream($c->tx->connection);
     my $id     = $c->tx->connection;
     $clients->{$id} = $stream;
-    $stream->on(close => sub { delete $clients->{$id} });
+    dlog("/events: connect id=$id total=" . scalar(keys %$clients));
+    $stream->on(close => sub {
+        dlog("/events: disconnect id=$id remaining=" . (scalar(keys %$clients) - 1));
+        delete $clients->{$id};
+    });
 
     $c->res->headers->content_type('text/event-stream');
     $c->res->headers->cache_control('no-cache');
@@ -408,14 +455,18 @@ post '/snapshot' => sub {
     my $mime = $c->req->headers->content_type // 'image/jpeg';
     $mime = 'image/jpeg' unless $mime =~ m{^image/};
 
+    dlog("/snapshot: camera='$cam' size=$size mime=$mime");
+
     # Evict oldest camera entry if cap reached
     if (!exists $snapshots{$cam} && scalar(keys %snapshots) >= $snapshot_cap) {
         my ($oldest) = sort { $snapshots{$a}{ts} <=> $snapshots{$b}{ts} } keys %snapshots;
         delete $snapshots{$oldest};
+        dlog("/snapshot: evicted '$oldest' (cap=$snapshot_cap)");
         app->log->warn("Snapshot camera cap ($snapshot_cap) reached — evicted: $oldest");
     }
 
     $snapshots{$cam} = { data => $body, mime => $mime, ts => time() };
+    dlog("/snapshot: stored ok total=" . scalar(keys %snapshots));
     app->log->info("Snapshot stored: $cam ($size bytes)");
 
     $c->render(json => { status => 'ok', camera => $cam, bytes => $size });

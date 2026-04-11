@@ -53,6 +53,18 @@ app->hook(before_server_start => sub {
 
 app->log->level('info');
 
+my $DEBUG = $ENV{DEBUG} // 0;
+app->log->level($DEBUG ? 'debug' : 'info');
+sub dlog { app->log->debug(shift) if $DEBUG }
+
+if ($DEBUG) {
+    dlog("=== dashboard.pl startup ===");
+    dlog("DASHBOARD_PORT=$port  LISTEN_HOST=$host");
+    dlog("TRIGGERED_URL=$triggered_url");
+    dlog("TRIGGERED_LOG=$log_file");
+    dlog("WEBHOOK_TOKEN=" . ($token ? "[REDACTED len=" . length($token) . "]" : "[unset]"));
+}
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
@@ -67,26 +79,50 @@ get '/api/ping' => sub {
 # so the React frontend never makes a cross-origin image request.
 # ---------------------------------------------------------------------------
 
+get '/api/snapshots' => sub {
+    my $c  = shift;
+    dlog("/api/snapshots: upstream=$triggered_url/api/snapshots");
+    my $ua = Mojo::UserAgent->new;
+    $ua->connect_timeout(3)->request_timeout(5);
+    my $tx = $ua->get("$triggered_url/api/snapshots");
+    if ($tx->result->is_success) {
+        dlog("/api/snapshots: OK status=" . $tx->result->code . " bytes=" . length($tx->result->body));
+        $c->res->headers->content_type('application/json');
+        $c->res->headers->cache_control('no-cache');
+        $c->render(data => $tx->result->body);
+    } else {
+        dlog("/api/snapshots: FAILED status=" . $tx->result->code);
+        $c->render(json => { cameras => [] });
+    }
+};
+
 get '/api/snapshot/:camera' => sub {
     my $c   = shift;
     my $cam = $c->param('camera') // '';
     $cam =~ s/[^A-Za-z0-9_\-\s]//g;
     $cam = substr($cam, 0, 64);
+    $cam =~ s/^\s+|\s+$//g;
+
+    # URL-encode for safe use in the upstream request path
+    (my $enc = $cam) =~ s/([^A-Za-z0-9._~-])/sprintf('%%%02X', ord($1))/ge;
+    dlog("/api/snapshot/$cam: upstream=$triggered_url/snapshot/$enc");
 
     my $ua = Mojo::UserAgent->new;
     $ua->connect_timeout(3)->request_timeout(5);
 
-    my $tx = $ua->get("$triggered_url/snapshot/$cam");
+    my $tx = $ua->get("$triggered_url/snapshot/$enc");
 
     if ($tx->result->is_success) {
         my $res = $tx->result;
         my $ct  = $res->headers->content_type // 'image/jpeg';
         my $ts  = $res->headers->header('X-Snapshot-Ts') // '';
+        dlog("/api/snapshot/$cam: OK status=" . $tx->result->code . " bytes=" . length($res->body) . " ct=$ct");
         $c->res->headers->content_type($ct);
         $c->res->headers->cache_control('no-cache, no-store');
         $c->res->headers->header('X-Snapshot-Ts' => $ts) if $ts;
         $c->render(data => $res->body);
     } else {
+        dlog("/api/snapshot/$cam: FAILED status=" . $tx->result->code);
         $c->reply->not_found;
     }
 };
@@ -97,12 +133,14 @@ get '/api/snapshot/:camera' => sub {
 
 get '/api/log-stream' => sub {
     my $c = shift;
+    dlog("/api/log-stream: client connected, log=$log_file");
 
     $c->inactivity_timeout(0);
     $c->res->headers->content_type('text/event-stream');
     $c->res->headers->cache_control('no-cache');
 
     unless (-e $log_file) {
+        dlog("/api/log-stream: log not found, entering polling wait");
         $c->write("data: " . encode_json({
             type => 'system',
             text => "Waiting for log file: $log_file",
@@ -111,6 +149,7 @@ get '/api/log-stream' => sub {
         my $watcher;
         $watcher = Mojo::IOLoop->recurring(2 => sub {
             return unless -e $log_file;
+            dlog("/api/log-stream: log appeared after polling");
             Mojo::IOLoop->remove($watcher);
             $c->write("data: " . encode_json({
                 type => 'system',
@@ -130,8 +169,10 @@ get '/api/log-stream' => sub {
             return;
         };
 
-    my @all = <$fh>;
-    my $start = @all > 100 ? @all - 100 : 0;
+    my @all   = <$fh>;
+    my $total = scalar @all;
+    my $start = $total > 100 ? $total - 100 : 0;
+    dlog("/api/log-stream: opened ok total_lines=$total sending from line $start");
     for my $i ($start .. $#all) {
         chomp(my $line = $all[$i]);
         next unless length $line;
@@ -143,16 +184,22 @@ get '/api/log-stream' => sub {
     }
 
     seek $fh, 0, 2;
+    dlog("/api/log-stream: seeked to EOF byte=" . tell($fh) . ", starting tail poll");
 
     my $tail_timer = Mojo::IOLoop->recurring(0.5 => sub {
+        my $new_lines = 0;
         while (defined(my $line = <$fh>)) {
             chomp $line;
             next unless length $line;
+            $new_lines++;
             $c->write("data: " . encode_json({
                 type     => 'line',
                 text     => $line,
                 historic => \0,
             }) . "\n\n");
+        }
+        if ($new_lines > 0) {
+            dlog("/api/log-stream: poll: $new_lines new line(s), pos=" . tell($fh));
         }
     });
 
@@ -161,6 +208,7 @@ get '/api/log-stream' => sub {
     });
 
     $c->on(finish => sub {
+        dlog("/api/log-stream: client disconnected, cleaning up");
         Mojo::IOLoop->remove($tail_timer);
         Mojo::IOLoop->remove($hb_timer);
         close $fh;
@@ -474,9 +522,10 @@ __DATA__
       font-size: 10px; font-weight: 700; padding: 1px 7px;
       border-radius: 99px; white-space: nowrap;
     }
-    .hbadge-auto   { background: rgba(34,197,94,0.15);  color: var(--green); }
-    .hbadge-manual { background: rgba(59,130,246,0.15); color: var(--blue); }
-    .hbadge-active { background: rgba(239,68,68,0.15);  color: var(--red); animation: blink 1s step-end infinite; }
+    .hbadge-auto     { background: rgba(34,197,94,0.15);  color: var(--green); }
+    .hbadge-manual   { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .hbadge-active   { background: rgba(239,68,68,0.15);  color: var(--red); }
+    .hbadge-replaced { background: rgba(148,163,184,0.15); color: var(--muted); }
 
     .history-empty { color: var(--muted); font-style: italic; font-size: 12px; }
   </style>
@@ -564,32 +613,29 @@ function SnapshotViewer({ alertColor, cameraName }) {
   const [imgError,    setImgError]    = useState(false);
   const pollRef = useRef(null);
 
-  // Fetch available camera list whenever alert state changes
+  // Poll available camera list every 5 s (snapshots may arrive at any time)
   useEffect(() => {
-    if (alertColor !== 'red') {
-      setCameras([]);
-      setSelected('');
-      setImgSrc('');
-      setLastUpdated(null);
-      return;
-    }
     const load = () => {
-      fetch(`${CFG.triggeredUrl}/api/snapshots`)
+      fetch('/api/snapshots')
         .then(r => r.json())
         .then(d => {
           const cams = d.cameras || [];
           setCameras(cams);
-          // Auto-select: prefer current alert camera, else first in list
+          // Auto-select: prefer current alert camera, else previously selected, else first
           setSelected(prev => {
-            if (prev && cams.includes(prev)) return prev;
             if (cameraName && cams.includes(cameraName)) return cameraName;
+            if (prev && cams.includes(prev)) return prev;
             return cams[0] || '';
           });
+          // Clear panel when no cameras have live snapshots
+          if (cams.length === 0) {
+            setImgSrc('');
+            setLastUpdated(null);
+          }
         })
         .catch(() => {});
     };
     load();
-    // Re-check camera list every 5 s (new snapshots may arrive)
     const id = setInterval(load, 5000);
     return () => clearInterval(id);
   }, [alertColor, cameraName]);
@@ -609,7 +655,7 @@ function SnapshotViewer({ alertColor, cameraName }) {
     return () => clearInterval(pollRef.current);
   }, [selected]);
 
-  if (alertColor !== 'red' || cameras.length === 0) return null;
+  if (cameras.length === 0) return null;
 
   return (
     <div className="card snapshot-card">
@@ -673,10 +719,12 @@ function HistoryPanel({ triggeredUrl }) {
       <div className="card-title">Alert History</div>
       <div className="history-list">
         {history.map((entry, i) => {
-          const badgeClass = !entry.cleared_by ? 'hbadge-active'
-            : entry.cleared_by === 'manual'    ? 'hbadge-manual'
+          const badgeClass = !entry.cleared_by        ? 'hbadge-active'
+            : entry.cleared_by === 'manual'           ? 'hbadge-manual'
+            : entry.cleared_by === 'replaced'         ? 'hbadge-replaced'
             : 'hbadge-auto';
           const badgeText = !entry.cleared_by ? 'active'
+            : entry.cleared_by === 'replaced' ? 'replaced'
             : entry.duration != null ? `${entry.duration}s ${entry.cleared_by}`
             : entry.cleared_by;
           return (

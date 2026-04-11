@@ -58,6 +58,7 @@ ALERT_SOUND=""
 TRIGGERED_LOG="$APP_DIR/triggered.log"
 TRIGGERED_URL=""   # computed after host/port are resolved
 MODE="dev"
+DEBUG="0"
 
 # ── Load .trigctl.env (if present) ───────────────────────────────────────────
 # shellcheck disable=SC1090
@@ -77,7 +78,7 @@ for arg in "$@"; do
       val="${arg#*=}"
       case "$key" in
         LISTEN_HOST|PORT|DASHBOARD_PORT|RESET_DELAY|WEBHOOK_TOKEN|\
-        LOG_FILE|DASHBOARD_LOG|ALERT_SOUND|TRIGGERED_LOG|TRIGGERED_URL|MODE)
+        LOG_FILE|DASHBOARD_LOG|ALERT_SOUND|TRIGGERED_LOG|TRIGGERED_URL|MODE|DEBUG)
           printf -v "$key" '%s' "$val"
           ;;
         *) echo "Warning: unknown variable '$key' ignored" >&2 ;;
@@ -193,6 +194,7 @@ build_triggered_env() {
   )
   [[ -n "$WEBHOOK_TOKEN" ]] && _TENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
   [[ -n "$ALERT_SOUND"   ]] && _TENV+=("ALERT_SOUND=$ALERT_SOUND")
+  [[ "$DEBUG" == "1" ]]    && _TENV+=("DEBUG=1")
 }
 
 build_dashboard_env() {
@@ -205,19 +207,25 @@ build_dashboard_env() {
     "HYPNOTOAD_PID=$DASHBOARD_HPID"
   )
   [[ -n "$WEBHOOK_TOKEN" ]] && _DENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
+  [[ "$DEBUG" == "1" ]]    && _DENV+=("DEBUG=1")
 }
 
 # Find the hypnotoad master PID for a port.
-# The master is the daemonised process (PPID=1) that is listening on the port.
+# Prefers the PPID=1 daemon; falls back to any listener on the port.
 # Called only AFTER wait_ready confirms the server is up, so no polling needed.
 master_pid_for_port() {
-  local port="$1" candidate ppid pids
-  pids="$(lsof -iTCP:"$port" -sTCP:LISTEN -nP 2>/dev/null | awk 'NR>1{print $2}')"
+  local port="$1" candidate ppid pids first_pid=""
+  pids="$(lsof -iTCP:"$port" -sTCP:LISTEN -nP 2>/dev/null | awk 'NR>1{print $2}' | sort -u)"
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
+    # Remember the first live process as fallback
+    [[ -z "$first_pid" ]] && proc_alive "$candidate" && first_pid="$candidate"
     ppid="$(ps -p "$candidate" -o ppid= 2>/dev/null | tr -d ' ')"
     [[ "$ppid" == "1" ]] && proc_alive "$candidate" && echo "$candidate" && return 0
   done <<< "$pids"
+  # No PPID=1 process found (some macOS versions reparent differently) —
+  # return the first live listener on this port as the best available answer.
+  [[ -n "$first_pid" ]] && echo "$first_pid" && return 0
   return 1
 }
 
@@ -278,7 +286,14 @@ cmd_start() {
   if wait_ready "http://127.0.0.1:${PORT}/"; then
     t_ok=true
     if [[ "$MODE" == "prod" ]]; then
-      local t_pid; t_pid="$(master_pid_for_port "$PORT" || true)"
+      local t_pid=""
+      # Primary: read the pid file hypnotoad wrote itself (stable once HTTP is up)
+      if [[ -f "$TRIGGERED_HPID" ]]; then
+        t_pid="$(cat "$TRIGGERED_HPID" 2>/dev/null | tr -d '[:space:]')"
+        proc_alive "$t_pid" || t_pid=""
+      fi
+      # Fallback: scan the listening port
+      [[ -z "$t_pid" ]] && t_pid="$(master_pid_for_port "$PORT" || true)"
       [[ -n "$t_pid" ]] && save_pid triggered "$t_pid"
     fi
     ok "triggered.pl  →  http://${LISTEN_HOST}:${PORT}"
@@ -289,7 +304,14 @@ cmd_start() {
   if wait_ready "http://127.0.0.1:${DASHBOARD_PORT}/api/ping"; then
     d_ok=true
     if [[ "$MODE" == "prod" ]]; then
-      local d_pid; d_pid="$(master_pid_for_port "$DASHBOARD_PORT" || true)"
+      local d_pid=""
+      # Primary: read the pid file hypnotoad wrote itself
+      if [[ -f "$DASHBOARD_HPID" ]]; then
+        d_pid="$(cat "$DASHBOARD_HPID" 2>/dev/null | tr -d '[:space:]')"
+        proc_alive "$d_pid" || d_pid=""
+      fi
+      # Fallback: scan the listening port
+      [[ -z "$d_pid" ]] && d_pid="$(master_pid_for_port "$DASHBOARD_PORT" || true)"
       [[ -n "$d_pid" ]] && save_pid dashboard "$d_pid"
     fi
     ok "dashboard.pl  →  http://${LISTEN_HOST}:${DASHBOARD_PORT}"
@@ -302,6 +324,9 @@ cmd_start() {
     cmd_stop
     exit 1
   fi
+
+  # Persist the mode so 'trigctl status' can display it without --prod/--dev flag
+  echo "$MODE" > "$PID_DIR/mode"
 
   echo
   say "${BOLD}${GREEN}Both servers are up.${RESET}"
@@ -330,6 +355,9 @@ cmd_stop() {
 
   # Remove hypnotoad pid files so the next start is always treated as fresh
   rm -f "$TRIGGERED_HPID" "$DASHBOARD_HPID"
+
+  # Remove persisted mode
+  rm -f "$PID_DIR/mode"
 }
 
 # ── status ────────────────────────────────────────────────────────────────────
@@ -386,7 +414,9 @@ cmd_status() {
   echo
   say "  Alert server:  ${CYAN}http://${LISTEN_HOST}:${PORT}${RESET}"
   say "  Dashboard:     ${CYAN}http://${LISTEN_HOST}:${DASHBOARD_PORT}${RESET}"
-  say "  Mode:          ${MODE}"
+  local display_mode="$MODE"
+  [[ -f "$PID_DIR/mode" ]] && display_mode="$(cat "$PID_DIR/mode" 2>/dev/null | tr -d '[:space:]')"
+  say "  Mode:          ${display_mode}"
 }
 
 # ── reload (zero-downtime, prod only) ─────────────────────────────────────────
@@ -499,6 +529,7 @@ ${BOLD}VARIABLES${RESET}  (pass as KEY=VALUE args, or set in .trigctl.env)
   QUIET_END            Quiet hours end   HH:MM 24h (e.g. 07:00)
   SNAPSHOT_TTL         Seconds before snapshots expire  (default: 300)
   SNAPSHOT_MAX_BYTES   Max snapshot upload size         (default: 2097152)
+  DEBUG                Set 1 to enable verbose debug logging (default: 0)
 
 ${BOLD}CONFIG FILE${RESET}
   ${APP_DIR}/.trigctl.env
