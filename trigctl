@@ -190,7 +190,7 @@ build_triggered_env() {
     "LISTEN_HOST=$LISTEN_HOST"
     "RESET_DELAY=$RESET_DELAY"
     "LOG_FILE=$LOG_FILE"
-    "HYPNOTOAD_PID=$TRIGGERED_HPID"
+    "TRIGGERED_PID_FILE=$TRIGGERED_HPID"
   )
   [[ -n "$WEBHOOK_TOKEN" ]] && _TENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
   [[ -n "$ALERT_SOUND"   ]] && _TENV+=("ALERT_SOUND=$ALERT_SOUND")
@@ -204,27 +204,32 @@ build_dashboard_env() {
     "TRIGGERED_URL=$TRIGGERED_URL"
     "TRIGGERED_LOG=$TRIGGERED_LOG"
     "RESET_DELAY=$RESET_DELAY"
-    "HYPNOTOAD_PID=$DASHBOARD_HPID"
+    "DASHBOARD_PID_FILE=$DASHBOARD_HPID"
   )
   [[ -n "$WEBHOOK_TOKEN" ]] && _DENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
   [[ "$DEBUG" == "1" ]]    && _DENV+=("DEBUG=1")
 }
 
-# Find the hypnotoad master PID for a port.
-# Prefers the PPID=1 daemon; falls back to any listener on the port.
-# Called only AFTER wait_ready confirms the server is up, so no polling needed.
+# Find the hypnotoad manager PID for a port.
+# In hypnotoad, WORKERS hold the listen socket (PPID=manager). The manager
+# itself (PPID=1) does not listen directly. We find a worker's PPID to get
+# the manager. For simple daemon mode (dev), the single listener IS the target.
 master_pid_for_port() {
   local port="$1" candidate ppid pids first_pid=""
   pids="$(lsof -iTCP:"$port" -sTCP:LISTEN -nP 2>/dev/null | awk 'NR>1{print $2}' | sort -u)"
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
-    # Remember the first live process as fallback
-    [[ -z "$first_pid" ]] && proc_alive "$candidate" && first_pid="$candidate"
+    proc_alive "$candidate" || continue
+    [[ -z "$first_pid" ]] && first_pid="$candidate"
     ppid="$(ps -p "$candidate" -o ppid= 2>/dev/null | tr -d ' ')"
-    [[ "$ppid" == "1" ]] && proc_alive "$candidate" && echo "$candidate" && return 0
+    if [[ -n "$ppid" && "$ppid" != "1" ]]; then
+      # Listener's parent is the hypnotoad manager — return the manager PID
+      proc_alive "$ppid" && echo "$ppid" && return 0
+    else
+      # PPID=1: this listener is itself the daemon (dev/simple prefork mode)
+      echo "$candidate" && return 0
+    fi
   done <<< "$pids"
-  # No PPID=1 process found (some macOS versions reparent differently) —
-  # return the first live listener on this port as the best available answer.
   [[ -n "$first_pid" ]] && echo "$first_pid" && return 0
   return 1
 }
@@ -256,8 +261,8 @@ cmd_start() {
 
   if [[ "$MODE" == "prod" ]]; then
     # hypnotoad daemonizes itself; run from APP_DIR so relative paths work.
-    # HYPNOTOAD_PID is passed to each script so they write to distinct pid
-    # files and never mistake each other for an existing running instance.
+    # TRIGGERED_PID_FILE / DASHBOARD_PID_FILE are passed to each script so
+    # they write to distinct pid files and never collide.
     info "Starting triggered.pl  (hypnotoad)"
     ( cd "$APP_DIR" && env "${_TENV[@]}" hypnotoad triggered.pl )
 
@@ -337,26 +342,39 @@ cmd_start() {
 cmd_stop() {
   section "Stopping visual_alert"
 
-  for name in triggered dashboard; do
-    local pid
-    pid="$(get_pid "$name")"
+  local pid=""
 
-    if [[ -z "$pid" ]]; then
-      warn "${name}.pl  not running"
-    else
-      # SIGTERM asks the hypnotoad master (or daemon) to stop gracefully.
-      # The master drains workers before exiting.
-      kill -TERM "$pid" 2>/dev/null && ok "${name}.pl  (PID $pid) stopped" \
-        || fail "Could not stop ${name}.pl  (PID $pid)"
-    fi
+  # triggered — prefer hypnotoad's own pid file (always has the manager PID)
+  pid=""
+  if [[ -f "$TRIGGERED_HPID" ]]; then
+    pid="$(cat "$TRIGGERED_HPID" 2>/dev/null | tr -d '[:space:]')"
+    proc_alive "$pid" || pid=""
+  fi
+  [[ -z "$pid" ]] && pid="$(get_pid triggered)"
+  if [[ -z "$pid" ]]; then
+    warn "triggered.pl  not running"
+  else
+    kill -TERM "$pid" 2>/dev/null && ok "triggered.pl  (PID $pid) stopped" \
+      || fail "Could not stop triggered.pl  (PID $pid)"
+  fi
+  rm -f "$PID_DIR/triggered.pid"
 
-    rm -f "$PID_DIR/${name}.pid"
-  done
+  # dashboard — same pattern
+  pid=""
+  if [[ -f "$DASHBOARD_HPID" ]]; then
+    pid="$(cat "$DASHBOARD_HPID" 2>/dev/null | tr -d '[:space:]')"
+    proc_alive "$pid" || pid=""
+  fi
+  [[ -z "$pid" ]] && pid="$(get_pid dashboard)"
+  if [[ -z "$pid" ]]; then
+    warn "dashboard.pl  not running"
+  else
+    kill -TERM "$pid" 2>/dev/null && ok "dashboard.pl  (PID $pid) stopped" \
+      || fail "Could not stop dashboard.pl  (PID $pid)"
+  fi
+  rm -f "$PID_DIR/dashboard.pid"
 
-  # Remove hypnotoad pid files so the next start is always treated as fresh
   rm -f "$TRIGGERED_HPID" "$DASHBOARD_HPID"
-
-  # Remove persisted mode
   rm -f "$PID_DIR/mode"
 }
 

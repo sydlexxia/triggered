@@ -14,6 +14,7 @@ log/
 
 # Claude Code session data
 .claude/
+CLAUDE.local.md
 
 # macOS
 .DS_Store
@@ -27,3 +28,10 @@ log/
 
 # Perl local deps
 local/
+
+# Project-specific untracked items
+CLAUDE.md
+bin/
+alert.mp3
+alert.OFF
+Triggered-darwin-x64/

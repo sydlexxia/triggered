@@ -42,7 +42,7 @@ warn "[dashboard] Alert server: $triggered_url\n";
 
 app->config(hypnotoad => {
     listen   => ["http://$host:$port"],
-    pid_file => $ENV{HYPNOTOAD_PID} // '/tmp/dashboard-hypnotoad.pid',
+    pid_file => $ENV{DASHBOARD_PID_FILE} // '/tmp/dashboard-hypnotoad.pid',
 });
 
 app->hook(before_server_start => sub {

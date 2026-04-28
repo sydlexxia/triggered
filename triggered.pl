@@ -93,7 +93,7 @@ warn "[triggered] Push notifications: $notify_url\n"          if $notify_url;
 app->config(hypnotoad => {
     listen   => ["http://$host:$port"],
     workers  => 1,
-    pid_file => $ENV{HYPNOTOAD_PID} // '/tmp/triggered-hypnotoad.pid',
+    pid_file => $ENV{TRIGGERED_PID_FILE} // '/tmp/triggered-hypnotoad.pid',
 });
 
 app->hook(before_server_start => sub {
