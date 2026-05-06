@@ -4,12 +4,22 @@ A lightweight, real-time visual alert system built with Perl + Mojolicious.
 An external system (CI pipeline, monitoring tool, cron job, etc.) fires a webhook — every connected browser instantly flips to a red **ALERT** screen, then auto-resets to green after a configurable countdown.
 A companion React dashboard provides a live status panel, real-time log viewer, alert history, and camera snapshot viewer.
 
+### Screenshots
+In Idle state - No current Triggers <br>
+Dashboard View - Trigger State, event log and history<p>
+<p><img width="1809" height="1006" alt="Idle+Dashboard" src="https://github.com/user-attachments/assets/965c3938-7911-4fc5-8fa9-7a8e0f385a37" /></p>
+
+In Alert state - Active Trigger (Shown: ALERT with camera name [Shop] and reset countdown timer)<br>
+Dashboard View - Active Trigger, Snapshot, event log and history<p>
+<p><img width="1811" height="1013" alt="ALERT+Dashboard" src="https://github.com/user-attachments/assets/d46c7e1b-db08-4987-afae-15e44d886f7d" /></p>
+<p></p>
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │  triggered.pl          dashboard.pl                 │
-│  :3000                 :3001                        │
+│  Port:3000             Port:3001                    │
 │                                                     │
-│  POST /webhook  ──►  SSE /events  ──►  browser      │
+│  POST /webhook   ──►  SSE /events  ──►  browser     │
 │  POST /reset          /api/log-stream               │
 │  POST /snapshot       /api/snapshots (proxy)        │
 │  GET  /events         GET /                         │
@@ -49,10 +59,10 @@ cpanm Mojolicious
 
 ### 1. Configure
 
-Copy your settings into `.trigctl.env` in the project directory (it's gitignored):
+Create `.trigctl.env` in the main folder (if it doesn't already exist) with the following three lines:
 
 ```
-WEBHOOK_TOKEN=your_secret_here
+WEBHOOK_TOKEN=place_your_token_here
 LISTEN_HOST=0.0.0.0
 RESET_DELAY=60
 ```
@@ -60,7 +70,7 @@ RESET_DELAY=60
 ### 2. (Optional) Add trigctl to PATH
 
 ```bash
-ln -sf /path/to/visual_alert/trigctl ~/bin/trigctl
+export PATH="$PATH:/path/to/trigctl"
 ```
 
 ### 3. Start
@@ -103,10 +113,10 @@ trigctl stop      # graceful shutdown of both servers
 
 | Flag | Server | Use case |
 |---|---|---|
-| `--dev` *(default)* | `perl daemon` | Development — single process, auto-reloads on source changes |
-| `--prod` | `hypnotoad` | Production — prefork, graceful restarts, zero-downtime reload |
+| `--dev` *(default)* | `perl daemon` | Development = single process, auto-reloads on source changes |
+| `--prod` | `hypnotoad` | Production = prefork, graceful restarts, zero-downtime reload |
 
-### Config file — `.trigctl.env`
+### Config file: `.trigctl.env`
 
 Variables in this file are loaded as defaults on every invocation. The file is gitignored to keep secrets out of version control.
 
@@ -162,7 +172,7 @@ DEBUG=1 trigctl start
 
 ## Configuration
 
-All configuration is done via environment variables — no file editing required.
+All configuration is done via environment variables, no file editing required.
 The easiest way to manage them is via `.trigctl.env` (see above).
 
 ### triggered.pl
@@ -172,7 +182,7 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 | `PORT` | `3000` | Listen port |
 | `LISTEN_HOST` | `127.0.0.1` | Bind address |
 | `RESET_DELAY` | `60` | Seconds before auto-reset to green |
-| `WEBHOOK_TOKEN` | *(unset)* | Bearer token required on `/webhook`, `/reset`, and `/snapshot`. If unset, endpoints are open — a warning is printed at startup |
+| `WEBHOOK_TOKEN` | *(unset)* | Bearer token required on `/webhook`, `/reset`, and `/snapshot`. If unset, endpoints are open and a warning is printed at startup |
 | `LOG_FILE` | `./triggered.log` | Path to write log output |
 | `ALERT_SOUND` | *(unset)* | Path to an audio file (`.mp3`, `.wav`, `.ogg`, `.m4a`) played in the browser when an alert fires. Served to the browser at `/alert-sound`. If unset, the alert is silent |
 | `CAMERA_ALLOW` | *(unset)* | Comma-separated list of camera names. When set, only cameras in this list trigger an alert; all others are suppressed |
@@ -201,7 +211,7 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 ## API Reference
 
 ### `POST /webhook`
-Triggers an alert — sets state to **red** and starts the auto-reset countdown.
+Triggers an alert, sets state to **red** and starts the auto-reset countdown.
 Accepts an optional body with a `camera` field in JSON, `camera:Name` plain-text (Blue Iris default), or `?camera=Name` URL parameter.
 
 ```bash
@@ -235,7 +245,7 @@ trigctl trigger "Front Door"
 ---
 
 ### `POST /reset`
-Manually clears the alert — sets state to **green** immediately, cancels the timer.
+Manually clears the alert, sets state to **green** immediately, cancels the timer.
 
 ```bash
 curl -X POST \
@@ -287,7 +297,7 @@ curl -X POST \
 
 ---
 
-### `GET /snapshot/:camera`
+### `GET /snapshot/camera`
 Serves the most recent stored snapshot for a camera. Returns `404` if no snapshot exists or if it has expired (`SNAPSHOT_TTL`).
 
 ```bash
@@ -331,7 +341,7 @@ curl http://127.0.0.1:3000/api/history
 ---
 
 ### `GET /` *(triggered.pl)*
-The alert page — a full-screen colour display that reacts to the SSE stream.
+The alert page: a full-screen colour display that reacts to the SSE stream.
 Green = **OK**, Red = **ALERT** with a live countdown, Amber = **QUIET** (alert during quiet hours).
 
 ---
@@ -387,10 +397,10 @@ When `DEBUG=1`:
 
 **dashboard.pl** logs:
 - Full config/env dump at startup
-- Log tail operations — file open, total lines, seek position
+- Log tail operations, file open, total lines, seek position
 - New lines found on each 0.5-second poll tick
 - Log file not-found polling and file-appearance events
-- Snapshot proxy requests — upstream URL, HTTP status, bytes, content-type
+- Snapshot proxy requests, upstream URL, HTTP status, bytes, content-type
 - SSE log-stream client connect and disconnect
 
 Debug lines appear in **cyan** in the dashboard's log viewer.
@@ -401,7 +411,7 @@ Debug lines appear in **cyan** in the dashboard's log viewer.
 
 ### Blue Iris — Silent Tripwire Motion Alert
 
-[Blue Iris](https://blueirissoftware.com) is a Windows-based video surveillance platform that supports webhook **Alert Actions** on any camera trigger. Pairing it with `triggered.pl` turns any motion event into a silent, instantaneous full-screen visual alert on any connected browser — no sound, no popup, no notification fatigue.
+[Blue Iris](https://blueirissoftware.com) is a Windows-based video surveillance platform that supports webhook **Alert Actions** on any camera trigger. Pairing it with `triggered.pl` turns any motion event into a silent, instantaneous full-screen visual alert on any connected browser, optional custom alert-sound, no popup, no notification fatigue.
 
 **Setup:**
 
