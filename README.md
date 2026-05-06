@@ -187,7 +187,7 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 | `ALERT_SOUND` | *(unset)* | Path to an audio file (`.mp3`, `.wav`, `.ogg`, `.m4a`) played in the browser when an alert fires. Served to the browser at `/alert-sound`. If unset, the alert is silent |
 | `CAMERA_ALLOW` | *(unset)* | Comma-separated list of camera names. When set, only cameras in this list trigger an alert; all others are suppressed |
 | `CAMERA_IGNORE` | *(unset)* | Comma-separated list of camera names to always suppress (logged but never trigger an alert) |
-| `QUIET_START` | *(unset)* | Start of quiet hours in 24h `HH:MM` format (e.g. `22:00`). Alerts during quiet hours show an amber **QUIET** state instead of red |
+| `QUIET_START` | *(unset)* | Start of quiet hours in 24h `HH:MM` format (e.g. `22:00`). During quiet hours the display turns amber and shows a countdown; incoming webhooks are silently logged with no visual or audio alert |
 | `QUIET_END` | *(unset)* | End of quiet hours in 24h `HH:MM` format (e.g. `07:00`). Wraps midnight correctly |
 | `NOTIFY_URL` | *(unset)* | Push notification endpoint. Supports ntfy.sh, Slack, Discord, or any generic HTTP webhook |
 | `NOTIFY_ON_RESET` | `0` | Set `1` to also send a push notification when the alert clears |
@@ -275,7 +275,7 @@ curl -N http://127.0.0.1:3000/events
 data: {"color":"red","reset_in":42,"camera":"Front Door","quiet":false}
 ```
 
-`color` is `"green"`, `"red"`, or `"amber"` (red during quiet hours). A 30-second heartbeat comment (`: ping`) keeps proxy connections alive.
+`color` is `"green"` or `"red"`. The `quiet` field is `true` when quiet hours are active (display shows amber **QUIET** regardless of color). A 30-second heartbeat comment (`: ping`) keeps proxy connections alive.
 
 ---
 
@@ -342,7 +342,7 @@ curl http://127.0.0.1:3000/api/history
 
 ### `GET /` *(triggered.pl)*
 The alert page: a full-screen colour display that reacts to the SSE stream.
-Green = **OK**, Red = **ALERT** with a live countdown, Amber = **QUIET** (alert during quiet hours).
+Green = **OK**, Red = **ALERT** with a reset countdown, Amber = **QUIET** with a countdown to when quiet hours end. Incoming webhooks during quiet hours are silently logged with no visual or audio change.
 
 ---
 
@@ -512,7 +512,7 @@ repeated webhooks while already in alert state).
 
 ### Enable quiet hours
 
-During quiet hours, incoming webhooks still record history but the alert state is set to **amber** rather than red, and the browser displays **QUIET** instead of **ALERT**. Add to `.trigctl.env`:
+During quiet hours the display turns amber and shows **QUIET** with a live countdown to when quiet hours end. Incoming webhooks are silently recorded in history and the log — no visual change, no audio alert, no push notification. Add to `.trigctl.env`:
 
 ```
 QUIET_START=22:00

@@ -522,10 +522,11 @@ __DATA__
       font-size: 10px; font-weight: 700; padding: 1px 7px;
       border-radius: 99px; white-space: nowrap;
     }
-    .hbadge-auto     { background: rgba(34,197,94,0.15);  color: var(--green); }
-    .hbadge-manual   { background: rgba(59,130,246,0.15); color: var(--blue); }
-    .hbadge-active   { background: rgba(239,68,68,0.15);  color: var(--red); }
+    .hbadge-auto     { background: rgba(34,197,94,0.15);   color: var(--green); }
+    .hbadge-manual   { background: rgba(59,130,246,0.15);  color: var(--blue); }
+    .hbadge-active   { background: rgba(239,68,68,0.15);   color: var(--red); }
     .hbadge-replaced { background: rgba(148,163,184,0.15); color: var(--muted); }
+    .hbadge-quiet    { background: rgba(245,158,11,0.15);  color: var(--amber); }
 
     .history-empty { color: var(--muted); font-style: italic; font-size: 12px; }
   </style>
@@ -550,6 +551,15 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function fmtQuietCountdown(s) {
+  const h   = Math.floor(s / 3600);
+  const m   = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `Quiet ends in ${h}h ${String(m).padStart(2,'0')}m`;
+  if (m > 0) return `Quiet ends in ${m}m ${String(sec).padStart(2,'0')}s`;
+  return `Quiet ends in ${sec}s`;
+}
+
 function ConnectionBadge({ state }) {
   return <span className={`badge badge-${state}`}>{state}</span>;
 }
@@ -569,8 +579,8 @@ function Clock() {
 
 // ── Status Panel ───────────────────────────────────────────────────────────
 
-function StatusPanel({ color, quiet, camera, countdown, connState, soundAvailable, soundMuted, onSoundToggle }) {
-  const isAmber = color === 'red' && quiet;
+function StatusPanel({ color, quiet, camera, countdown, quietCountdown, connState, soundAvailable, soundMuted, onSoundToggle }) {
+  const isAmber = quiet;  // amber whenever quiet hours active (idle or alert)
   const orbClass   = isAmber ? 'orb-amber'   : color === 'red' ? 'orb-red'   : color === 'green' ? 'orb-green'   : 'orb-unknown';
   const labelClass = isAmber ? 'label-amber'  : color === 'red' ? 'label-red'  : color === 'green' ? 'label-green' : 'label-unknown';
   const labelText  = isAmber ? 'QUIET'        : color === 'red' ? 'ALERT'      : color === 'green' ? 'OK'          : '—';
@@ -587,6 +597,10 @@ function StatusPanel({ color, quiet, camera, countdown, connState, soundAvailabl
       <div className="status-countdown">
         {color === 'red' && countdown > 0
           ? `Auto-reset in ${countdown}s`
+          : quiet && color !== 'red' && quietCountdown > 0
+          ? fmtQuietCountdown(quietCountdown)
+          : quiet && color !== 'red'
+          ? 'Quiet hours active'
           : color === 'green'
           ? 'All clear'
           : 'Connecting to alert server…'}
@@ -719,12 +733,14 @@ function HistoryPanel({ triggeredUrl }) {
       <div className="card-title">Alert History</div>
       <div className="history-list">
         {history.map((entry, i) => {
-          const badgeClass = !entry.cleared_by        ? 'hbadge-active'
-            : entry.cleared_by === 'manual'           ? 'hbadge-manual'
-            : entry.cleared_by === 'replaced'         ? 'hbadge-replaced'
+          const badgeClass = !entry.cleared_by              ? 'hbadge-active'
+            : entry.cleared_by === 'manual'               ? 'hbadge-manual'
+            : entry.cleared_by === 'replaced'             ? 'hbadge-replaced'
+            : entry.cleared_by === 'quiet'                ? 'hbadge-quiet'
             : 'hbadge-auto';
-          const badgeText = !entry.cleared_by ? 'active'
-            : entry.cleared_by === 'replaced' ? 'replaced'
+          const badgeText = !entry.cleared_by             ? 'active'
+            : entry.cleared_by === 'replaced'             ? 'replaced'
+            : entry.cleared_by === 'quiet'                ? 'quiet hrs'
             : entry.duration != null ? `${entry.duration}s ${entry.cleared_by}`
             : entry.cleared_by;
           return (
@@ -838,10 +854,12 @@ function App() {
   const [logLines,       setLogLines]       = useState([]);
   const [logConn,        setLogConn]        = useState('connecting');
   const [autoScroll,     setAutoScroll]     = useState(true);
-  const [soundAvailable, setSoundAvailable] = useState(false);
-  const [soundMuted,     setSoundMuted]     = useState(false);
-  const countdownRef = useRef(null);
-  const lineIdRef    = useRef(0);
+  const [soundAvailable,  setSoundAvailable]  = useState(false);
+  const [soundMuted,      setSoundMuted]      = useState(false);
+  const [quietCountdown,  setQuietCountdown]  = useState(0);
+  const countdownRef      = useRef(null);
+  const quietCountdownRef = useRef(null);
+  const lineIdRef         = useRef(0);
   const audioRef     = useRef(null);
   const prevColorRef = useRef('unknown');
 
@@ -888,10 +906,29 @@ function App() {
       } else {
         setCountdown(0);
       }
+
+      if (quietCountdownRef.current) { clearInterval(quietCountdownRef.current); quietCountdownRef.current = null; }
+      if (data.quiet && data.quiet_until && data.color !== 'red') {
+        let rem = Math.max(0, Math.round(data.quiet_until - Date.now() / 1000));
+        setQuietCountdown(rem);
+        if (rem > 0) {
+          quietCountdownRef.current = setInterval(() => {
+            rem--;
+            if (rem <= 0) { clearInterval(quietCountdownRef.current); quietCountdownRef.current = null; setQuietCountdown(0); }
+            else setQuietCountdown(rem);
+          }, 1000);
+        }
+      } else {
+        setQuietCountdown(0);
+      }
     };
 
     es.onerror = () => setStatusConn('disconnected');
-    return () => { es.close(); if (countdownRef.current) clearInterval(countdownRef.current); };
+    return () => {
+      es.close();
+      if (countdownRef.current) clearInterval(countdownRef.current);
+      if (quietCountdownRef.current) clearInterval(quietCountdownRef.current);
+    };
   }, [soundMuted]);
 
   // Log SSE
@@ -930,6 +967,7 @@ function App() {
         quiet={alertQuiet}
         camera={cameraName}
         countdown={countdown}
+        quietCountdown={quietCountdown}
         connState={statusConn}
         soundAvailable={soundAvailable}
         soundMuted={soundMuted}

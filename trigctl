@@ -59,6 +59,14 @@ TRIGGERED_LOG="$APP_DIR/triggered.log"
 TRIGGERED_URL=""   # computed after host/port are resolved
 MODE="dev"
 DEBUG="0"
+QUIET_START=""
+QUIET_END=""
+NOTIFY_URL=""
+NOTIFY_ON_RESET="0"
+CAMERA_ALLOW=""
+CAMERA_IGNORE=""
+SNAPSHOT_TTL="300"
+SNAPSHOT_MAX_BYTES="2097152"
 
 # ── Load .trigctl.env (if present) ───────────────────────────────────────────
 # shellcheck disable=SC1090
@@ -78,7 +86,9 @@ for arg in "$@"; do
       val="${arg#*=}"
       case "$key" in
         LISTEN_HOST|PORT|DASHBOARD_PORT|RESET_DELAY|WEBHOOK_TOKEN|\
-        LOG_FILE|DASHBOARD_LOG|ALERT_SOUND|TRIGGERED_LOG|TRIGGERED_URL|MODE|DEBUG)
+        LOG_FILE|DASHBOARD_LOG|ALERT_SOUND|TRIGGERED_LOG|TRIGGERED_URL|MODE|DEBUG|\
+        QUIET_START|QUIET_END|NOTIFY_URL|NOTIFY_ON_RESET|\
+        CAMERA_ALLOW|CAMERA_IGNORE|SNAPSHOT_TTL|SNAPSHOT_MAX_BYTES)
           printf -v "$key" '%s' "$val"
           ;;
         *) echo "Warning: unknown variable '$key' ignored" >&2 ;;
@@ -192,9 +202,17 @@ build_triggered_env() {
     "LOG_FILE=$LOG_FILE"
     "TRIGGERED_PID_FILE=$TRIGGERED_HPID"
   )
-  [[ -n "$WEBHOOK_TOKEN" ]] && _TENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
-  [[ -n "$ALERT_SOUND"   ]] && _TENV+=("ALERT_SOUND=$ALERT_SOUND")
-  [[ "$DEBUG" == "1" ]]    && _TENV+=("DEBUG=1")
+  [[ -n "$WEBHOOK_TOKEN"     ]] && _TENV+=("WEBHOOK_TOKEN=$WEBHOOK_TOKEN")
+  [[ -n "$ALERT_SOUND"       ]] && _TENV+=("ALERT_SOUND=$ALERT_SOUND")
+  [[ -n "$QUIET_START"       ]] && _TENV+=("QUIET_START=$QUIET_START")
+  [[ -n "$QUIET_END"         ]] && _TENV+=("QUIET_END=$QUIET_END")
+  [[ -n "$NOTIFY_URL"        ]] && _TENV+=("NOTIFY_URL=$NOTIFY_URL")
+  [[ "$NOTIFY_ON_RESET" == "1" ]] && _TENV+=("NOTIFY_ON_RESET=1")
+  [[ -n "$CAMERA_ALLOW"      ]] && _TENV+=("CAMERA_ALLOW=$CAMERA_ALLOW")
+  [[ -n "$CAMERA_IGNORE"     ]] && _TENV+=("CAMERA_IGNORE=$CAMERA_IGNORE")
+  [[ "$SNAPSHOT_TTL"       != "300"     ]] && _TENV+=("SNAPSHOT_TTL=$SNAPSHOT_TTL")
+  [[ "$SNAPSHOT_MAX_BYTES" != "2097152" ]] && _TENV+=("SNAPSHOT_MAX_BYTES=$SNAPSHOT_MAX_BYTES")
+  [[ "$DEBUG" == "1" ]]          && _TENV+=("DEBUG=1")
 }
 
 build_dashboard_env() {
@@ -422,10 +440,16 @@ cmd_status() {
       | grep '^data:' | head -1 | sed 's/^data: //')"
     if [[ -n "$state_json" ]]; then
       color="$(echo "$state_json" | grep -o '"color":"[^"]*"' | cut -d'"' -f4)"
-      case "$color" in
-        red)   say "\n  Alert state:  ${RED}${BOLD}ALERT${RESET}" ;;
-        green) say "\n  Alert state:  ${GREEN}OK${RESET}" ;;
-      esac
+      quiet_val="$(echo "$state_json" | grep -o '"quiet":true' || true)"
+      if [[ -n "$quiet_val" && "$color" == "red" ]]; then
+        say "\n  Alert state:  ${YELLOW}${BOLD}QUIET${RESET}  ${DIM}(alert during quiet hours)${RESET}"
+      elif [[ -n "$quiet_val" ]]; then
+        say "\n  Alert state:  ${YELLOW}QUIET HOURS${RESET}"
+      elif [[ "$color" == "red" ]]; then
+        say "\n  Alert state:  ${RED}${BOLD}ALERT${RESET}"
+      else
+        say "\n  Alert state:  ${GREEN}OK${RESET}"
+      fi
     fi
   fi
 

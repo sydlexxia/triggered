@@ -152,6 +152,16 @@ sub reset_remaining {
     return $rem > 0 ? int($rem) : 0;
 }
 
+# Return Unix epoch when current quiet period ends (undef if not in quiet hours)
+sub quiet_until_epoch {
+    return undef unless $quiet_mode && $quiet_end;
+    my ($end_h, $end_m) = split /:/, $quiet_end;
+    my @t = localtime(time());
+    my $end_epoch = POSIX::mktime(0, int($end_m), int($end_h), $t[3], $t[4], $t[5]);
+    $end_epoch += 86400 if $end_epoch <= time();  # end already passed today → tomorrow
+    return $end_epoch;
+}
+
 # Return 1 if the current local time falls within [QUIET_START, QUIET_END)
 sub in_quiet_hours {
     return 0 unless $quiet_start && $quiet_end;
@@ -208,10 +218,11 @@ sub extract_camera {
 # Broadcast current state to all SSE clients
 sub notify_clients {
     my $payload = encode_json({
-        color    => $color,
-        reset_in => reset_remaining(),
-        camera   => $camera_name,
-        quiet    => $quiet_mode ? \1 : \0,
+        color       => $color,
+        reset_in    => reset_remaining(),
+        camera      => $camera_name,
+        quiet       => $quiet_mode ? \1 : \0,
+        quiet_until => quiet_until_epoch(),
     });
     dlog("notify_clients: count=" . scalar(keys %$clients) . " payload=$payload");
     for my $id (keys %$clients) {
@@ -323,7 +334,23 @@ post '/webhook' => sub {
         return $c->render(json => { status => 'suppressed', camera => $cam });
     }
 
-    dlog("/webhook: ALERT prev_color=$color quiet=$quiet_mode");
+    # Quiet hours: record in history and log, but make no display or audio change
+    if ($quiet_mode) {
+        my $cam_info = $cam ? " (camera: $cam)" : '';
+        dlog("/webhook: quiet hours — logging only${cam_info}");
+        app->log->info("Alert suppressed — quiet hours${cam_info}");
+        push @history, {
+            camera     => $cam,
+            ts         => time(),
+            cleared_at => time(),
+            cleared_by => 'quiet',
+            duration   => undef,
+        };
+        shift @history if @history > 100;
+        return $c->render(json => { status => 'suppressed', reason => 'quiet hours', camera => $cam });
+    }
+
+    dlog("/webhook: ALERT prev_color=$color");
     $camera_name = $cam;
     $color       = 'red';
     $alert_time  = time();
@@ -348,14 +375,11 @@ post '/webhook' => sub {
     shift @history if @history > 100;
 
     my $cam_info = $camera_name ? " (camera: $camera_name)" : '';
-    my $q_info   = $quiet_mode  ? ' [quiet hours]'           : '';
-    app->log->info("Alert triggered via webhook${cam_info}${q_info}");
+    app->log->info("Alert triggered via webhook${cam_info}");
 
-    # Push notification (non-blocking via next-tick timer)
     if ($notify_url) {
         my $notif_cam = $camera_name;
         my $notif_msg = $camera_name ? "Alert – $camera_name" : 'Alert triggered';
-        $notif_msg   .= ' (quiet hours)' if $quiet_mode;
         Mojo::IOLoop->timer(0 => sub { send_notification($notif_msg, $notif_cam) });
     }
 
@@ -364,7 +388,7 @@ post '/webhook' => sub {
         color    => $color,
         reset_in => $reset_delay,
         camera   => $camera_name,
-        quiet    => $quiet_mode ? \1 : \0,
+        quiet    => \0,
     });
 };
 
@@ -420,10 +444,11 @@ get '/events' => sub {
     $c->res->headers->header('Access-Control-Allow-Origin' => '*');
 
     my $payload = encode_json({
-        color    => $color,
-        reset_in => reset_remaining(),
-        camera   => $camera_name,
-        quiet    => $quiet_mode ? \1 : \0,
+        color       => $color,
+        reset_in    => reset_remaining(),
+        camera      => $camera_name,
+        quiet       => $quiet_mode ? \1 : \0,
+        quiet_until => quiet_until_epoch(),
     });
     $c->write("data: $payload\n\n");
 };
@@ -731,7 +756,9 @@ __DATA__
     var source           = new EventSource('/events');
     var countdownTimer   = null;
     var secondsRemaining = 0;
-    var currentColor     = 'green';
+    var quietTimer       = null;
+    var quietRemaining   = 0;
+    var currentColor     = 'green';  // logical alert color: 'green' | 'red'
 
     source.onopen = function () {
       document.getElementById('conn-status').textContent = 'connected';
@@ -739,27 +766,27 @@ __DATA__
 
     source.onmessage = function (e) {
       var data = JSON.parse(e.data);
-      applyState(data.color, data.reset_in || 0, data.camera || '', data.quiet || false);
+      applyState(data.color, data.reset_in || 0, data.camera || '', data.quiet || false, data.quiet_until || 0);
     };
 
     source.onerror = function () {
       document.getElementById('conn-status').textContent = 'reconnecting…';
     };
 
-    function applyState(color, resetIn, camera, quiet) {
-      var wasGreen = currentColor !== 'red' && currentColor !== 'amber';
-      currentColor = (color === 'red' && quiet) ? 'amber' : color;
+    function applyState(color, resetIn, camera, quiet, quietUntil) {
+      var wasAlertActive = (currentColor === 'red');
+      currentColor = color;
 
       var bgColor =
-        color === 'red' && quiet  ? '#b45309' :
-        color === 'red'           ? '#dc2626' : '#15803d';
+        quiet           ? '#b45309' :
+        color === 'red' ? '#dc2626' : '#15803d';
 
       document.body.style.backgroundColor = bgColor;
       document.getElementById('theme-meta').setAttribute('content', bgColor);
 
       document.getElementById('label').textContent =
-        color === 'red' && quiet  ? 'QUIET'  :
-        color === 'red'           ? 'ALERT'  : 'OK';
+        quiet           ? 'QUIET' :
+        color === 'red' ? 'ALERT' : 'OK';
 
       document.getElementById('camera').textContent =
         (color === 'red' && camera) ? camera : '';
@@ -767,10 +794,13 @@ __DATA__
       clearInterval(countdownTimer);
       countdownTimer   = null;
       secondsRemaining = 0;
+      clearInterval(quietTimer);
+      quietTimer     = null;
+      quietRemaining = 0;
       document.getElementById('countdown').textContent = '';
 
       if (color === 'red') {
-        if (wasGreen) playAlert();
+        if (!wasAlertActive) playAlert();
         if (resetIn > 0) {
           secondsRemaining = resetIn;
           renderCountdown();
@@ -785,6 +815,21 @@ __DATA__
             }
           }, 1000);
         }
+      } else if (quiet && quietUntil) {
+        quietRemaining = Math.max(0, Math.round(quietUntil - Date.now() / 1000));
+        if (quietRemaining > 0) {
+          renderQuietCountdown();
+          quietTimer = setInterval(function () {
+            quietRemaining--;
+            if (quietRemaining <= 0) {
+              clearInterval(quietTimer);
+              quietTimer = null;
+              document.getElementById('countdown').textContent = '';
+            } else {
+              renderQuietCountdown();
+            }
+          }, 1000);
+        }
       }
     }
 
@@ -792,6 +837,19 @@ __DATA__
       document.getElementById('countdown').textContent =
         'Auto-reset in ' + secondsRemaining + 's';
     }
+
+    function renderQuietCountdown() {
+      var h = Math.floor(quietRemaining / 3600);
+      var m = Math.floor((quietRemaining % 3600) / 60);
+      var s = quietRemaining % 60;
+      document.getElementById('countdown').textContent = h > 0
+        ? 'Quiet ends in ' + h + 'h ' + pad2(m) + 'm'
+        : m > 0
+        ? 'Quiet ends in ' + m + 'm ' + pad2(s) + 's'
+        : 'Quiet ends in ' + s + 's';
+    }
+
+    function pad2(n) { return n < 10 ? '0' + n : '' + n; }
 
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(function () {});
