@@ -1,8 +1,17 @@
 # triggered
 
-A lightweight, real-time visual alert system built with Perl + Mojolicious.
-An external system (CI pipeline, monitoring tool, cron job, etc.) fires a webhook — every connected browser instantly flips to a red **ALERT** screen, then auto-resets to green after a configurable countdown.
-A companion React dashboard provides a live status panel, real-time log viewer, alert history, and camera snapshot viewer.
+A lightweight, real-time alert system built with Perl and Mojolicious. It connects to anything that can fire a webhook or run a command and turns events into clear, immediate signals... visual, audible, or both.
+
+When something triggers, every connected browser flips to an ALERT state, then resets after a configurable delay. No digging through logs or waiting on notifications. You see it as it happens.
+
+The React dashboard provides a live status view, real-time logs, alert history, and camera snapshots, so you can quickly understand what triggered the event.
+
+It works with Blue Iris, IP cameras, motion sensors, CI pipelines, monitoring tools, cron jobs, whatever you already have in place, and has been designed to be displayed on any device.
+
+Typical uses: package delivery, pets at the door, driveway activity, monitored entry/exit events, doors opening or closing.
+
+Simple by design. It surfaces events clearly and immediately, without adding complexity, yet remains easily adaptable to your needs.  
+
 
 ### Screenshots
 In Idle state - No current Triggers <br>
@@ -432,7 +441,7 @@ Debug lines appear in **cyan** in the dashboard's log viewer.
    trigctl start
    ```
 
-2. In Blue Iris, open **Camera Properties → Alerts → On alert…** and add a **Web request** action:
+2. In BlueIris, open **Camera Properties → Alerts → On alert…** and add a **Web request** action:
 
    | Field | Value |
    |---|---|
@@ -444,11 +453,11 @@ Debug lines appear in **cyan** in the dashboard's log viewer.
 
 **How it works:**
 
-- Blue Iris detects motion → fires the webhook → all open browser windows flip to **red** instantly
+- BlueIris detects motion → fires the webhook → all open browser windows flip to **red** instantly
 - The triggering camera's name (via `&CAM` substitution in the request body) is displayed prominently on the alert screen and in the dashboard status panel
 - Set `ALERT_SOUND=/path/to/alert.mp3` in `.trigctl.env` to enable an in-browser audio alert — a 🔊/🔇 toggle button appears on both the alert page and dashboard
 - No desktop notifications — purely visual (and optionally audio), making it ideal as an unobtrusive background monitor or a dedicated wall-mounted display
-- The screen auto-resets to **green** after `RESET_DELAY` seconds (default 60), or immediately when Blue Iris sends a reset via `POST /reset` on the **alert ends** action
+- The screen auto-resets to **green** after `RESET_DELAY` seconds (default 60), or immediately when BlueIris sends a reset via `POST /reset` on the **alert ends** action
 - Multiple cameras can all point to the same webhook endpoint — any one of them triggers the alert, and the camera name identifies which one fired
 - Use `CAMERA_IGNORE` to suppress noisy cameras, or `CAMERA_ALLOW` to restrict alerts to specific cameras only
 - The dashboard at `:3001` logs each camera-triggered event with a timestamp in the live log viewer
@@ -463,16 +472,16 @@ Add a second Web request action under **On alert end…**:
 | **Post/Payload** | `camera:&CAM` |
 | **Add HTTP Headers** | `Authorization: Bearer webhook_token` |
 
-This clears the screen the moment Blue Iris considers the motion event over, rather than waiting for the countdown.
+This clears the screen the moment BlueIris considers the motion event over, rather than waiting for the countdown.
 
-**Optional — push snapshots from Blue Iris:**
+**Optional — push snapshots from BlueIris:**
 
-In Blue Iris's **On alert** action, add a second Web request to push the camera frame:
+In BlueIris's **On alert** action, add a second Web request to push the camera frame:
 
 | Field | Value |
 |---|---|
 | **URL** | `http://<alert-server-ip>:3000/snapshot?camera=&CAM` |
-| **Post/Payload** | *(image binary via Blue Iris HTTP post feature)* |
+| **Post/Payload** | *(image binary via BlueIris HTTP post feature)* |
 | **Add HTTP Headers** | `Authorization: Bearer webhook_token` |
 
 Snapshots appear in the dashboard's camera viewer panel and are available for `SNAPSHOT_TTL` seconds.
