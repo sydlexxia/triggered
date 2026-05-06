@@ -12,7 +12,14 @@ Dashboard View - Trigger State, event log and history<p>
 In Alert state - Active Trigger (Shown: ALERT with camera name [Shop] and reset countdown timer)<br>
 Dashboard View - Active Trigger, Snapshot, event log and history<p>
 <p><img width="1811" height="1013" alt="ALERT+Dashboard" src="https://github.com/user-attachments/assets/d46c7e1b-db08-4987-afae-15e44d886f7d" /></p>
+
+In Quiet state - QUIET Displayed with countdown timer <br>
+Dashboard View - Active State shown with countdown timer. Triggered alerts are quietly added to the logfile, alert history is updated<p>
+<p><img width="1773" height="1009" alt="Image" src="https://github.com/user-attachments/assets/192454ab-a6ad-4ff3-af2b-3b7de9200b63" /></p>
 <p></p>
+<p></p>
+
+## Endpoints
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -60,10 +67,11 @@ cpanm Mojolicious
 ### 1. Configure
 
 Create `.trigctl.env` in the main folder (if it doesn't already exist) with the following three lines:
+(Note: enter 0.0.0.0 if you want triggered.pl and dashboard.pl answer on all interfaces configured for the host)
 
 ```
 WEBHOOK_TOKEN=place_your_token_here
-LISTEN_HOST=0.0.0.0
+LISTEN_HOST=0.0.0.0 
 RESET_DELAY=60
 ```
 
