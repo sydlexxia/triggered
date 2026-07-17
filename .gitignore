@@ -16,6 +16,10 @@ log/
 .claude/
 CLAUDE.local.md
 
+# Claude task instructions & session planning notes (local only)
+INSTRUCTIONS_FOR_CLAUDE.md
+docs/mojolicious-removal-plan.md
+
 # macOS
 .DS_Store
 .AppleDouble
@@ -28,6 +32,11 @@ CLAUDE.local.md
 
 # Perl local deps
 local/
+
+# ALT_ALERTS display overrides — production images are site-local, never
+# committed. Only the usage README ships, so the folder exists after clone.
+ALT_ALERTS/*
+!ALT_ALERTS/README.txt
 
 # Project-specific untracked items
 CLAUDE.md

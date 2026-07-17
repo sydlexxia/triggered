@@ -211,6 +211,26 @@ The easiest way to manage them is via `.trigctl.env` (see above).
 | `SNAPSHOT_TTL` | `300` | Seconds before a stored camera snapshot is considered expired |
 | `SNAPSHOT_MAX_BYTES` | `2097152` | Maximum snapshot upload size in bytes (default 2 MB) |
 | `DEBUG` | `0` | Set `1` to enable verbose debug logging. Debug lines appear in cyan in the dashboard log viewer |
+| `ALT_ALERTS_DIR` | `./ALT_ALERTS` | Folder of display-override files (see [ALT_ALERTS display overrides](#alt_alerts-display-overrides)) |
+
+### ALT_ALERTS display overrides
+
+Instead of the plain alert color, the alert page can display a custom PNG image per state. Drop a file named for the state into the `ALT_ALERTS` folder:
+
+| State | Normal display | Override file |
+|---|---|---|
+| Normal | green **OK** | `green.png` |
+| Alert | red **ALERT** | `red.png` |
+| Quiet hours | amber **QUIET** | `amber.png` |
+
+Rules:
+
+- **PNG only.** HTML overrides are deliberately not supported: an HTML file would execute script in every viewer's browser, so that surface was removed by design.
+- Any other files in the folder are ignored.
+- Files are detected **live** (checked every 5 seconds and on every state change) — add, remove, or edit files without restarting the server.
+- Images are shown full-screen (`object-fit: cover` — scaled to fill, edges may crop). A PNG with transparency composites over the state color.
+- Sound, auto-reset countdown, and quiet-hours behavior are unchanged — only the visual display is replaced.
+- Overrides are served at `GET /alt-alert/<state>.png`; only the three whitelisted filenames are ever served.
 
 ### dashboard.pl
 

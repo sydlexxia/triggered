@@ -21,6 +21,14 @@
 #   QUIET_END         — quiet hours end   HH:MM 24h local (e.g. 07:00)
 #                       During quiet hours alerts are amber (push still fires)
 #
+#   ALT_ALERTS_DIR    — folder of display overrides        (default: ./ALT_ALERTS)
+#                       If <state>.png exists there (state = green | red |
+#                       amber), the browser shows that image full-screen
+#                       instead of the plain alert color. PNG only — HTML
+#                       overrides were deliberately removed for security
+#                       (no script execution surface). Other files ignored.
+#                       Checked live — add/remove files without restarting.
+#
 #   SNAPSHOT_TTL      — seconds before snapshots expire   (default: 300)
 #   SNAPSHOT_MAX_BYTES— max upload size per snapshot      (default: 2097152 = 2 MB)
 #
@@ -34,6 +42,7 @@
 #   GET  /snapshot/:cam  — serve latest snapshot for a camera
 #   GET  /api/snapshots  — JSON list of cameras with available snapshots
 #   GET  /alert-sound    — serves the ALERT_SOUND file (if configured)
+#   GET  /alt-alert/<state>.png — serves an ALT_ALERTS override (whitelisted names only)
 #   GET  /manifest.json, /icon.svg, /sw.js — PWA assets
 #
 # Deploy behind a TLS-terminating reverse proxy (nginx, caddy) for HTTPS.
@@ -66,6 +75,8 @@ my $camera_ignore_raw = $ENV{CAMERA_IGNORE} // '';
 my $quiet_start = $ENV{QUIET_START};   # e.g. "22:00"
 my $quiet_end   = $ENV{QUIET_END};     # e.g. "07:00"
 
+my $alt_dir     = $ENV{ALT_ALERTS_DIR} // './ALT_ALERTS';  # display-override folder
+
 my $snapshot_ttl  = $ENV{SNAPSHOT_TTL}        // 300;
 my $snapshot_max  = $ENV{SNAPSHOT_MAX_BYTES}  // 2_097_152;  # 2 MB
 my $snapshot_cap  = 20;  # max number of distinct cameras to store
@@ -87,6 +98,7 @@ unless ($token) {
 warn "[triggered] CAMERA_ALLOW filter: $camera_allow_raw\n"  if %cam_allow;
 warn "[triggered] CAMERA_IGNORE filter: $camera_ignore_raw\n" if %cam_ignore;
 warn "[triggered] Quiet hours: ${quiet_start}–${quiet_end}\n" if $quiet_start && $quiet_end;
+warn "[triggered] ALT_ALERTS overrides folder: $alt_dir\n"    if -d $alt_dir;
 warn "[triggered] Push notifications: $notify_url\n"          if $notify_url;
 
 # hypnotoad listen (production mode)
@@ -215,15 +227,60 @@ sub extract_camera {
     return $c->req->param('camera') // '';
 }
 
-# Broadcast current state to all SSE clients
-sub notify_clients {
-    my $payload = encode_json({
+# ---- ALT_ALERTS display overrides -----------------------------------------
+
+# Map the current server state to its display name.
+# quiet wins over everything (matches the front-end's precedence),
+# otherwise it's the plain alert color: 'green' or 'red'.
+sub effective_state {
+    return $quiet_mode ? 'amber' : $color;
+}
+
+# Look for an override image for a given state (green|red|amber).
+# WHY: lets the user drop in a custom image instead of the flat color.
+# PNG ONLY by deliberate security decision — HTML overrides would execute
+# arbitrary script in every viewer's browser; images have no such surface.
+# Returns a hashref { type, url } or undef if no override exists.
+# The file's mtime is appended as ?v= so browsers re-fetch edited files
+# instead of serving a stale cached copy.
+sub alt_alert_info {
+    my $state = shift;
+    return undef unless $state =~ /^(?:green|red|amber)$/;  # safety: never build paths from other input
+    my $path = "$alt_dir/$state.png";
+    return undef unless -f $path;
+    my $mtime = (stat($path))[9] // 0;
+    return { type => 'png', url => "/alt-alert/$state.png?v=$mtime" };
+}
+
+# Signature of all override files (name + mtime). Used by the recurring
+# scanner to detect adds/removes/edits so we only broadcast on real change.
+sub alt_alerts_signature {
+    my @sig;
+    for my $state (qw(green red amber)) {
+        my $path = "$alt_dir/$state.png";
+        push @sig, "$state.png=" . ((stat($path))[9] // 0) if -f $path;
+    }
+    return join(';', @sig);
+}
+
+# ---------------------------------------------------------------------------
+
+# Build the state payload shared by SSE broadcasts and the /events handshake.
+# Kept in one place so the two can never drift apart.
+sub state_payload {
+    return encode_json({
         color       => $color,
         reset_in    => reset_remaining(),
         camera      => $camera_name,
         quiet       => $quiet_mode ? \1 : \0,
         quiet_until => quiet_until_epoch(),
+        alt         => alt_alert_info(effective_state()),  # null when no override
     });
+}
+
+# Broadcast current state to all SSE clients
+sub notify_clients {
+    my $payload = state_payload();
     dlog("notify_clients: count=" . scalar(keys %$clients) . " payload=$payload");
     for my $id (keys %$clients) {
         $clients->{$id}->write("data: $payload\n\n");
@@ -308,6 +365,20 @@ Mojo::IOLoop->recurring(60 => sub {
     $quiet_mode = in_quiet_hours();
     if ($prev != $quiet_mode) {
         dlog("quiet_hours_check: mode changed prev=$prev new=$quiet_mode — broadcasting");
+        notify_clients();
+    }
+});
+
+# ALT_ALERTS — re-scan every 5 s so dropping in / removing / editing an
+# override file takes effect live without a restart or a state change.
+# WHY a signature compare: 6 stat() calls are cheap; broadcasting on every
+# tick is not. We only push to clients when the file set actually changed.
+my $alt_sig = alt_alerts_signature();
+Mojo::IOLoop->recurring(5 => sub {
+    my $sig = alt_alerts_signature();
+    if ($sig ne $alt_sig) {
+        dlog("alt_alerts_check: change detected ('$alt_sig' -> '$sig') — broadcasting");
+        $alt_sig = $sig;
         notify_clients();
     }
 });
@@ -443,14 +514,9 @@ get '/events' => sub {
     $c->res->headers->cache_control('no-cache');
     $c->res->headers->header('Access-Control-Allow-Origin' => '*');
 
-    my $payload = encode_json({
-        color       => $color,
-        reset_in    => reset_remaining(),
-        camera      => $camera_name,
-        quiet       => $quiet_mode ? \1 : \0,
-        quiet_until => quiet_until_epoch(),
-    });
-    $c->write("data: $payload\n\n");
+    # Same payload as broadcasts — built by state_payload() so a client
+    # connecting mid-state (incl. an active ALT_ALERTS override) is correct.
+    $c->write("data: " . state_payload() . "\n\n");
 };
 
 # Alert history (newest first, last 100 events)
@@ -549,6 +615,28 @@ get '/alert-sound' => sub {
     $c->reply->asset(Mojo::Asset::File->new(path => $alert_sound));
 };
 
+# Serve an ALT_ALERTS override image.
+# SECURITY: the filename must match the exact whitelist (green|red|amber
+# + .png). Everything else 404s, so ../ traversal or serving of arbitrary
+# files from the folder is impossible by construction. PNG only — .html
+# support was deliberately removed to eliminate script execution.
+# NOTE: '#file' (relaxed placeholder) not ':file' — the standard placeholder
+# stops at '.', so 'green.png' would arrive as file='green' + format='png'
+# and always fail the whitelist. '#' matches everything except '/'.
+get '/alt-alert/#file' => sub {
+    my $c    = shift;
+    my $file = $c->param('file');
+    return $c->reply->not_found
+        unless $file =~ /^(?:green|red|amber)\.png$/;
+    my $path = "$alt_dir/$file";
+    return $c->reply->not_found unless -f $path;
+    $c->res->headers->content_type('image/png');
+    # no-cache: the ?v=mtime cache-buster handles freshness; this prevents
+    # a proxy pinning an old copy under the same URL.
+    $c->res->headers->cache_control('no-cache');
+    $c->reply->asset(Mojo::Asset::File->new(path => $path));
+};
+
 # PWA — web app manifest
 get '/manifest.json' => sub {
     my $c = shift;
@@ -588,7 +676,8 @@ get '/sw.js' => sub {
     $c->res->headers->content_type('application/javascript');
     $c->render(text => <<'END_SW');
 const CACHE = 'visual-alert-v1';
-const BYPASS = ['/events', '/webhook', '/reset', '/snapshot', '/alert-sound', '/api/'];
+// /alt-alert must bypass the SW cache — overrides are live files on disk
+const BYPASS = ['/events', '/webhook', '/reset', '/snapshot', '/alert-sound', '/alt-alert', '/api/'];
 
 self.addEventListener('install',  () => self.skipWaiting());
 self.addEventListener('activate', () => clients.claim());
@@ -705,6 +794,26 @@ __DATA__
       opacity: 0.55;
       color: white;
     }
+
+    /* ALT_ALERTS override overlay.
+       Sits above the color panel (z-index 5) but below #controls (z-index 10)
+       so the sound/connection controls stay usable over a custom display. */
+    #alt-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 5;
+      display: none;
+    }
+    #alt-overlay.active { display: block; }
+    #alt-overlay img {
+      width: 100%;
+      height: 100%;
+      display: block;
+      /* Full-screen cover: fill viewport, preserve aspect, crop edges */
+      object-fit: cover;
+    }
+
+    #controls { z-index: 10; }
   </style>
 </head>
 <body>
@@ -713,6 +822,9 @@ __DATA__
     <div id="camera"></div>
     <div id="countdown"></div>
   </div>
+
+  <!-- ALT_ALERTS override display (filled by JS when the server reports one) -->
+  <div id="alt-overlay"></div>
 
   <div id="controls">
     <span id="conn-status">connecting…</span>
@@ -766,16 +878,52 @@ __DATA__
 
     source.onmessage = function (e) {
       var data = JSON.parse(e.data);
-      applyState(data.color, data.reset_in || 0, data.camera || '', data.quiet || false, data.quiet_until || 0);
+      applyState(data.color, data.reset_in || 0, data.camera || '', data.quiet || false, data.quiet_until || 0, data.alt || null);
     };
 
     source.onerror = function () {
       document.getElementById('conn-status').textContent = 'reconnecting…';
     };
 
-    function applyState(color, resetIn, camera, quiet, quietUntil) {
+    // ALT_ALERTS override handling ---------------------------------------
+    var altOverlay    = document.getElementById('alt-overlay');
+    var currentAltUrl = null;   // URL of the override currently displayed
+
+    // alt = { type: 'png', url: '/alt-alert/<state>.png?v=<mtime>' }
+    // or null when no override file exists for the current state.
+    // PNG only — HTML overrides were deliberately removed (security:
+    // no script execution surface on the alert display).
+    function applyAltOverride(alt) {
+      if (!alt) {
+        // No override — clear the overlay so the plain color shows again
+        if (currentAltUrl !== null) {
+          altOverlay.classList.remove('active');
+          altOverlay.innerHTML = '';
+          currentAltUrl = null;
+        }
+        return;
+      }
+      // WHY compare URLs: the server pushes full state on every SSE event;
+      // rebuilding the img each time would flicker. The ?v=mtime in the
+      // URL also means an edited file gets a new URL and is reloaded.
+      if (alt.url === currentAltUrl) return;
+      currentAltUrl = alt.url;
+      altOverlay.innerHTML = '';
+      var el = document.createElement('img');
+      el.src = alt.url;
+      el.alt = 'alert display override';
+      altOverlay.appendChild(el);
+      altOverlay.classList.add('active');
+    }
+    // --------------------------------------------------------------------
+
+    function applyState(color, resetIn, camera, quiet, quietUntil, alt) {
       var wasAlertActive = (currentColor === 'red');
       currentColor = color;
+
+      // Show/hide the ALT_ALERTS override first; the normal color logic
+      // below still runs so sound, countdowns and theme-color keep working.
+      applyAltOverride(alt);
 
       var bgColor =
         quiet           ? '#b45309' :
